@@ -1,0 +1,14 @@
+.env
+*.db
+*.db-*
+__pycache__/
+.venv/
+venv/
+logs/*
+!logs/.gitkeep
+logs/raw/
+var/
+web/d/
+web/morning.html
+*.pem
+.pytest_cache/
