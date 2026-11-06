@@ -26,10 +26,10 @@
     return localStorage.getItem("deskDataPath") || "";
   }
 
-  function baseUrl() {
-    const path = capturePath();
-    if (!path) return null;
-    return new URL("d/" + encodeURIComponent(path) + "/", new URL(".", location.href));
+  async function pull(file) {
+    const dataPath = capturePath();
+    if (!dataPath) throw new Error("missing");
+    return globalThis.DeskLive.loadDeskFile(file, { dataPath: dataPath, pageUrl: location.href });
   }
 
   function esc(value) {
@@ -62,16 +62,8 @@
     return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
-  async function pull(file) {
-    const root = baseUrl();
-    if (!root) throw new Error("missing");
-    const response = await fetch(new URL(file, root), { cache: "no-store" });
-    if (!response.ok) throw new Error(String(response.status));
-    return response.json();
-  }
-
   async function poll() {
-    if (!baseUrl()) {
+    if (!capturePath()) {
       render();
       return;
     }

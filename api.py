@@ -1,5 +1,6 @@
-"""Plan B JSON writer. Files land only under a secret directory from the environment.
+"""Plan B JSON writer. Plaintext files land only under a secret directory from the environment.
 
+The same bytes are encrypted into the live root for the public phone site.
 Nothing in this module reads a token out of the repository. Bare /d/ is not created.
 """
 
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 from config import GROUPS, SETTINGS, iso, parse_iso, utc_now
 from fields import dex_fields, pumpswap_pair
 from links import coin_url, profile_url
+from livecrypto import encrypt_envelope, envelope_bytes, is_live_path
 from logutil import file_logger, log
 from sources import DexRateLimit, dexscreener_batch
 from telegram import _equity
@@ -42,20 +44,51 @@ def health(authorization: str | None = Header(default=None)) -> Health:
     return Health(ok=True)
 
 
-def json_root() -> Path | None:
+def _data_path() -> str | None:
     data_path = os.environ.get("DATA_PATH") or ""
     if len(data_path) < 32 or "/" in data_path or "\\" in data_path or data_path in (".", ".."):
+        return None
+    return data_path
+
+
+def json_root() -> Path | None:
+    data_path = _data_path()
+    if data_path is None:
         return None
     base = Path(os.environ.get("JSON_ROOT") or "var/json")
     return base / "d" / data_path
 
 
-def _write(directory: Path, name: str, payload) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / name
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    temporary.replace(target)
+def live_root() -> Path:
+    return Path(os.environ.get("LIVE_ROOT") or "var/live")
+
+
+def _under(root: Path, relative: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root
+    for part in relative.split("/"):
+        path = path / part
+    resolved = path.resolve()
+    root_resolved = root.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise ValueError("path")
+    return path
+
+
+def _write_bytes(path: Path, raw: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(raw)
+    temporary.replace(path)
+
+
+def _emit(relative: str, payload, plain_root: Path, secret: str) -> None:
+    if not is_live_path(relative):
+        return
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    envelope = envelope_bytes(encrypt_envelope(raw, secret, relative))
+    _write_bytes(_under(plain_root, relative), raw)
+    _write_bytes(_under(live_root(), relative), envelope)
 
 
 def _public_rpc(url: str) -> str:
@@ -432,16 +465,21 @@ class Writer:
 
     def write_all(self) -> None:
         root = json_root()
-        if root is None:
+        secret = _data_path()
+        if root is None or secret is None:
             return
         equity = _equity(self.db, self.settings)
         self.db.add_balance(equity)
-        _write(root, "state.json", build_state(self.db, self.settings))
-        _write(root, "chart.json", build_chart(self.db, self.settings))
-        _write(root, "activity.json", build_activity(self.db))
-        coin_dir = root / "coin"
+        _emit("state.json", build_state(self.db, self.settings), root, secret)
+        _emit("chart.json", build_chart(self.db, self.settings), root, secret)
+        _emit("activity.json", build_activity(self.db), root, secret)
         for mint in self._screen_mints():
-            _write(coin_dir, f"{mint}.json", build_coin(self.db, self.settings, mint, self.bus.market.get(mint)))
+            _emit(
+                f"coin/{mint}.json",
+                build_coin(self.db, self.settings, mint, self.bus.market.get(mint)),
+                root,
+                secret,
+            )
 
     def _screen_mints(self) -> list[str]:
         since = self.settings.get("desk.night_start") or "1970"
