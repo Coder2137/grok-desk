@@ -1,4 +1,4 @@
-const SHELL = ["./index.html", "./app.css", "./app.js", "./chart.js", "./manifest.json", "./icons/icon-192.png", "./icons/apple-touch-icon.png"];
+const SHELL = ["./index.html", "./app.css", "./app.js", "./live.js", "./chart.js", "./manifest.json", "./icons/icon-192.png", "./icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open("desk-shell").then((cache) => cache.addAll(SHELL)));
@@ -11,7 +11,7 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
-  if (url.pathname.includes("/d/")) {
+  if (url.pathname.includes("/d/") || url.pathname.includes("/live/")) {
     return;
   }
   event.respondWith(
