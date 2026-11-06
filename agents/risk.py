@@ -187,7 +187,8 @@ class Risk:
     async def exit(self, position, price, reason, now) -> None:
         mode = position["mode"]
         entry = float(position["entry_price"])
-        pnl, fees = paper_pnl(entry, price, position["size_usd"])
+        route = self.settings.get("desk.fee_route") or "lowest"
+        pnl, fees = paper_pnl(entry, price, position["size_usd"], route=route)
         pct = ((float(price) / entry) - 1) * 100 if entry else 0
         name = position["name"] or position["mint"]
         text = exit_copy(mode, reason, name, pnl, pct, position["stop_pct"], position["timeout_h"])

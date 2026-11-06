@@ -55,6 +55,14 @@ The token needs permission to write the `live-data` branch and to dispatch workf
 
 GitHub Actions checks out `web/` from `main`, copies the `live-data` branch into `web/live/` when that branch exists, and deploys that site. The first deploy after merge already includes the encrypted snapshot in `web/live/`.
 
+## Fees
+
+PAPER PnL estimates Solana trading fees from the fomo help page "Trading fees on fomo" (article 14436214). The default `desk.fee_route` is `lowest`: 0.10 USDC under 5, 2% from 5 to 47.50, 0.95 USDC from 47.50 to 190, and 0.50% from 190 up. The fee is rounded half-up to cents. Solana gas, priority fees, and token rent stay 0 in the estimate because fomo covers them. No referral discount is applied. The route is chosen when you tap Buy or Sell. This process never taps, so the number is an estimate of that schedule.
+
+`conservative` uses the other Solana routes: 0.50% with a 0.95 USDC minimum. Under 5 USDC the lowest route is 0.10 and the other routes are 0.95, so a small PAPER sell on the default can be cheaper than the route that is actually available. After half-up cent rounding the schedules match from 47.25 USDC up. The published unrounded bands meet at 47.50. The default stays `lowest` until you set `fee_route` to `conservative`. The 47.50 ticket floor is this desk's minimum, not a fomo platform minimum.
+
+A full close fees the entry notional and the exit notional. Risk closes the whole position. A partial-exit estimate, `paper_pnl(..., sold_usd=...)`, fees only that slice: a pro-rata share of the entry fee, plus the sell fee on the slice proceeds.
+
 ## Tests
 
 ```bash
