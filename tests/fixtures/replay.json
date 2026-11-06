@@ -1,0 +1,23 @@
+{
+  "mint": "ReplayMint1111111111111111111111111",
+  "name": "Replay",
+  "symbol": "RPL",
+  "pool": "ReplayPool111111111111111111111111",
+  "liquidityUsd": 80000,
+  "price": 0.001,
+  "dex": {
+    "priceUsd": 0.001,
+    "liquidityUsd": 80000,
+    "marketCap": 250000,
+    "volumeM5": 4000,
+    "volumeH1": 30000,
+    "volumeH24": 90000,
+    "txnsM5Buys": 20,
+    "txnsM5Sells": 10,
+    "txnsH1Buys": 180,
+    "txnsH1Sells": 40,
+    "priceChangeM5": -6,
+    "priceChangeH1": 4,
+    "priceChangeH24": 12
+  }
+}
