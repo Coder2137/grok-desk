@@ -50,6 +50,7 @@ SETTINGS = {
     "desk.stack": ("float", 200, 1, 1_000_000_000),
     "desk.report_time": ("time", "08:00", None, None),
     "desk.notifier": ("enum", "telegram", ("telegram",), None),
+    "desk.fee_route": ("enum", "lowest", ("lowest", "conservative"), None),
     "desk.rpc_url": ("url", "https://api.mainnet-beta.solana.com", None, None),
     "desk.push_rejects": ("bool", False, None, None),
     "desk.fomo_handle": ("text", "", None, None),
@@ -85,6 +86,8 @@ ALIASES = {
     "mode": "analyst.mode",
     "analyst_mode": "analyst.mode",
     "notifier": "desk.notifier",
+    "fee_route": "desk.fee_route",
+    "fee route": "desk.fee_route",
     "rpc": "desk.rpc_url",
     "rpc_url": "desk.rpc_url",
     "fomo_handle": "desk.fomo_handle",
@@ -191,6 +194,8 @@ def validate(key: str, raw) -> tuple[bool, str, object]:
             if key == "analyst.mode":
                 value = value.lower()
             if key == "executor.below_min":
+                value = value.lower()
+            if key == "desk.fee_route":
                 value = value.lower()
             if value not in allowed:
                 return False, f"{key} must be one of {'|'.join(allowed)}", None
