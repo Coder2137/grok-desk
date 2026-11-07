@@ -418,6 +418,18 @@ def build_coin(db, settings, mint: str, market: dict | None = None) -> dict:
     link = coin_url(mint, "solana")
     holders = coin["holders"] if coin else None
     market = market or {}
+    scan_row = db.latest_scan(mint)
+    scan = None
+    if scan_row:
+        scan = {
+            "verdict": scan_row["verdict"],
+            "reason": scan_row["reason"],
+            "liquidity": scan_row["liquidity_usd"],
+            "top10": scan_row["top10_pct"],
+            "h1": scan_row["h1_change_pct"],
+            "ageMin": scan_row["age_min"],
+            "ts": scan_row["ts"],
+        }
     return {
         "mint": mint,
         "name": coin["name"] if coin else mint,
@@ -436,6 +448,7 @@ def build_coin(db, settings, mint: str, market: dict | None = None) -> dict:
         "liquidity": market.get("liquidityUsd"),
         "volume24": market.get("volumeH24"),
         "holders": holders,
+        "scan": scan,
         "position": None if not shown else _position(shown),
         "layers": layers,
         "link": link,
@@ -487,6 +500,9 @@ class Writer:
         mints.update(self.db.pushed_mints(since))
         for row in self.db.open_positions():
             mints.add(row["mint"])
+        for row in self.db.coins():
+            if row["mint"]:
+                mints.add(row["mint"])
         return sorted(mints)
 
     async def cover_prices(self) -> None:

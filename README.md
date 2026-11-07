@@ -35,7 +35,7 @@ A PumpPortal migration frame uses `mint`, `signature`, and `pool`. On the captur
 
 ## Phone
 
-GitHub Pages serves `web/` at the repository Pages URL. Open it once as `{pages url}#d=` plus the secret path. The app stores that in localStorage. Every 15 seconds it requests `d/<path>/state.json`, `chart.json`, `activity.json`, and `coin/<mint>.json`. If a file comes back as JSON, the app uses it. If that request 404s, the app fetches the same name under `live/` and decrypts it in the browser. The key is the SHA-256 of the stored path, and the additional data is the file name (`state.json`, `chart.json`, `activity.json`, or `coin/<mint>.json`). Settings, pause, and mode are changed in Telegram. The Account tab is read-only.
+GitHub Pages serves `web/` at the repository Pages URL. Open it once as `{pages url}#d=` plus the secret path. The app stores that in localStorage. Every 15 seconds it requests `d/<path>/state.json`, `chart.json`, `activity.json`, and `coin/<mint>.json`. A scanner rejection still gets a coin file: the scan verdict and reason are in it, and audit fields that were not measured stay null. If a file comes back as JSON, the app uses it. If that request 404s, the app fetches the same name under `live/` and decrypts it in the browser. The key is the SHA-256 of the stored path, and the additional data is the file name (`state.json`, `chart.json`, `activity.json`, or `coin/<mint>.json`). Settings, pause, and mode are changed in Telegram. The Account tab is read-only.
 
 Do not commit a `d/` directory. A request for bare `/d/` 404s. The public `live/` files are ciphertext envelopes (`v`, `alg`, `n`, `c`) with fixed names. They do not contain the path.
 
