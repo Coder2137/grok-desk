@@ -320,6 +320,7 @@
       <div class="screen-head"><button class="back" id="back">Back</button><h1>${esc(coin.name || coin.mint)}</h1></div>
       ${coin.mode === "PAPER" ? '<div class="paper">PAPER</div>' : ""}
       <p class="note">${esc(coin.symbol || "")} · Solana · ${esc(coin.age || "")} ${coin.shield ? "· " + esc(coin.shield) : ""}</p>
+      ${coin.scan ? `<p class="note">Scanner ${esc(coin.scan.verdict || "")}${coin.scan.reason ? " · " + esc(coin.scan.reason) : ""}</p>` : ""}
       <div class="big">${coin.price == null ? "—" : esc(Number(coin.price))}</div>
       <div class="screen">${changeHtml}</div>
       <div class="chart-wrap"><canvas class="chart" id="coin-chart"></canvas></div>

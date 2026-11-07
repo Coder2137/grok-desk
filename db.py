@@ -260,6 +260,12 @@ class Database:
             (ts,),
         ).fetchall()
 
+    def latest_scan(self, mint: str):
+        return self.conn.execute(
+            "SELECT * FROM scans WHERE mint = ? ORDER BY id DESC LIMIT 1",
+            (mint,),
+        ).fetchone()
+
     def passed_tonight(self, mint: str, since: str) -> bool:
         row = self.conn.execute(
             "SELECT 1 FROM scans WHERE mint = ? AND ts >= ? AND verdict = 'pass' LIMIT 1",

@@ -147,9 +147,10 @@ def audit_from_facts(facts: dict) -> dict:
     # 2 freeze
     freeze = facts.get("freeze_authority", MISSING)
     if freeze is MISSING:
-        layers.append(_layer(2, False, f"no data: {NO_DATA[2]}", "rpc"))
+        value = f"no data: {NO_DATA[2]}"
+        layers.append(_layer(2, False, value, "rpc"))
         _rest(3, layers)
-        return finish(False, layers[-1]["value"], 2)
+        return finish(False, value, 2)
     if freeze is None:
         layers.append(_layer(2, True, "Revoked", "rpc"))
     else:
@@ -177,9 +178,10 @@ def audit_from_facts(facts: dict) -> dict:
         return finish(False, "dev sold", 3)
     if dev_pct is None or dev_pct >= float(settings["auditor.max_dev_pct"]):
         shown = _fmt_pct(dev_pct or 0)
-        layers.append(_layer(3, False, f"dev holds {shown}%", "rpc"))
+        value = f"dev holds {shown}%"
+        layers.append(_layer(3, False, value, "rpc"))
         _rest(4, layers)
-        return finish(False, layers[-1]["value"], 3)
+        return finish(False, value, 3)
     layers.append(_layer(3, True, f"{_fmt_pct(dev_pct)}% · sold 0", "rpc"))
 
     # 4 top 10
@@ -205,9 +207,10 @@ def audit_from_facts(facts: dict) -> dict:
     top = kept[:10]
     top_pct = sum(item["balance"] for item in top) / supply * 100.0
     if top_pct >= float(settings["auditor.max_top10_pct"]):
-        layers.append(_layer(4, False, f"top 10 hold {_fmt_pct(top_pct)}%", "rpc"))
+        value = f"top 10 hold {_fmt_pct(top_pct)}%"
+        layers.append(_layer(4, False, value, "rpc"))
         _rest(5, layers)
-        return finish(False, layers[-1]["value"], 4)
+        return finish(False, value, 4)
     layers.append(_layer(4, True, f"{_fmt_pct(top_pct)}%", "rpc"))
 
     # 5 liquidity
@@ -266,9 +269,10 @@ def audit_from_facts(facts: dict) -> dict:
         return finish(False, "no data: bundles", 7)
     size = biggest_bundle(facts.get("nodes") or [], facts.get("links") or [])
     if size >= int(settings["auditor.max_bundled"]):
-        layers.append(_layer(7, False, f"{size} bundled wallets", "rugcheck"))
+        value = f"{size} bundled wallets"
+        layers.append(_layer(7, False, value, "rugcheck"))
         _rest(8, layers)
-        return finish(False, layers[-1]["value"], 7)
+        return finish(False, value, 7)
     layers.append(_layer(7, True, "None" if size <= 1 else str(size), "rugcheck"))
 
     # 8 delegations
