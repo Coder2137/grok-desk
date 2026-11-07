@@ -1,8 +1,9 @@
 """Raw key mapping. A missing key is null. Nothing here invents a key name.
 
-PumpPortal migration keys stay null until a live sample is mapped. A gitignored
-var/migration_keys.json may supply those four names on the operator machine.
-That file is never committed.
+The 2026-11-07 PumpPortal migration frame used mint, pool, signature, and
+txType migrate. creator was absent. pool's value is a venue label such as
+pump-amm, not an account address. A gitignored var/migration_keys.json may
+override those names on the operator machine. That file is never committed.
 """
 
 import json
@@ -16,11 +17,12 @@ class _Missing:
 
 MISSING = _Missing()
 
-# STEP 2 had no PumpPortal frame. None means "do not read".
+# Names from the observed migration frame. creator was not in that frame.
+# None means "do not read".
 MIGRATION_KEYS = {
-    "mint": None,
-    "pool": None,
-    "signature": None,
+    "mint": "mint",
+    "pool": "pool",
+    "signature": "signature",
     "creator": None,
 }
 
@@ -68,7 +70,10 @@ def as_text(value):
 
 
 def migration_fields(message, keys=None) -> dict:
-    """mint, pool, signature, creator. Unmapped or absent -> None."""
+    """mint, pool label, signature, creator. Unmapped or absent -> None.
+
+    pool is the venue label from the migration frame, not an account address.
+    """
     use = keys or load_migration_keys()
     out = {"mint": None, "pool": None, "signature": None, "creator": None}
     if not isinstance(message, dict):
@@ -81,6 +86,13 @@ def migration_fields(message, keys=None) -> dict:
             value = message.get(key)
             out[name] = None if value is None else str(value)
     return out
+
+
+def migration_frame(message, keys=None) -> dict | None:
+    """Fields from a subscribeMigration data frame. None for any other message."""
+    if not isinstance(message, dict) or message.get("txType") != "migrate":
+        return None
+    return migration_fields(message, keys)
 
 
 def pumpswap_pair(payload):

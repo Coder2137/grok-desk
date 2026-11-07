@@ -31,7 +31,7 @@ Set these in the environment or in a gitignored `.env`. Do not commit the values
 
 `python report.py` writes the morning page to `var/report/morning.html`. Run it on the morning schedule. It does not print secret values.
 
-PumpPortal migration field names are unset until a live frame is saved in `logs/raw/` (gitignored). Map `mint`, `pool`, `signature`, and `creator` in `var/migration_keys.json` on the operator machine. That file stays out of git.
+A PumpPortal migration frame uses `mint`, `signature`, and `pool`. On the captured frame `pool` was the venue label `pump-amm`, not an account address, and `creator` was absent so it stays null. The account address used later is the DexScreener pair address when that pair is known. The subscribe reply `Subscribed to 'migration' events.` is not a migration frame. `var/migration_keys.json` on the operator machine can override those names. That file stays out of git.
 
 ## Phone
 

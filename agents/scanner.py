@@ -8,13 +8,28 @@ import httpx
 import websockets
 
 from config import iso, parse_iso, utc_now
-from fields import dex_fields, migration_fields, pumpswap_pair
+from fields import dex_fields, migration_frame, pumpswap_pair
 from logutil import file_logger, log
 from sources import DexRateLimit, dexscreener_batch
 
 LOG = file_logger("scanner", "scanner.log")
 WS_URL = "wss://pumpportal.fun/api/data"
+SUBSCRIBE_MIGRATION = {"method": "subscribeMigration"}
+# Reply observed from that subscribe call. It is not a migration frame.
+SUBSCRIPTION_ACK = "Subscribed to 'migration' events."
 RAW_DIR = Path("logs") / "raw"
+
+
+def subscription_ack(message) -> bool:
+    """True only for the subscribeMigration acknowledgement, not a coin frame."""
+    return isinstance(message, dict) and message.get("message") == SUBSCRIPTION_ACK
+
+
+def _sample_is_ack(path: Path) -> bool:
+    try:
+        return subscription_ack(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
 
 
 def normalize_label(value: str) -> str:
@@ -113,6 +128,7 @@ class Scanner:
         self.bus = bus
         self.waiting: dict[str, dict] = {}
         self._sample_written = False
+        self._ack_sample_noted = False
 
     async def run(self) -> None:
         await asyncio.gather(self._socket(), self._poll())
@@ -122,7 +138,7 @@ class Scanner:
         while True:
             try:
                 async with websockets.connect(WS_URL, open_timeout=20) as socket:
-                    await socket.send(json.dumps({"method": "subscribeMigration"}))
+                    await socket.send(json.dumps(SUBSCRIBE_MIGRATION))
                     backoff = 1
                     while True:
                         try:
@@ -144,15 +160,24 @@ class Scanner:
             return
         if isinstance(message, dict) and message.get("method"):
             return
-        fields = migration_fields(message if isinstance(message, dict) else {})
+        if subscription_ack(message):
+            log(LOG, f"{iso(utc_now())} migration subscription acknowledged")
+            if not self._ack_sample_noted and _sample_is_ack(RAW_DIR / "migration-sample.json"):
+                self._ack_sample_noted = True
+                log(LOG, f"{iso(utc_now())} saved migration sample is a subscription ack")
+            return
+        fields = migration_frame(message)
+        if fields is None:
+            return
+        self._save_sample(message)
         if not fields["mint"]:
-            self._save_sample(message)
-            log(LOG, f"{iso(utc_now())} migration mint missing")
+            log(LOG, f"{iso(utc_now())} migration frame mint unset")
             return
         self.admit(
             {
                 "mint": fields["mint"],
-                "pool": fields["pool"],
+                "pool": None,
+                "pool_label": fields["pool"],
                 "signature": fields["signature"],
                 "creator": fields["creator"],
                 "migratedAt": iso(utc_now()),
@@ -160,13 +185,15 @@ class Scanner:
         )
 
     def _save_sample(self, message) -> None:
-        if self._sample_written:
+        if self._sample_written or subscription_ack(message):
             return
         try:
             RAW_DIR.mkdir(parents=True, exist_ok=True)
             path = RAW_DIR / "migration-sample.json"
-            if not path.exists():
-                path.write_text(json.dumps(message, default=str)[:20000], encoding="utf-8")
+            if path.exists() and not _sample_is_ack(path):
+                self._sample_written = True
+                return
+            path.write_text(json.dumps(message, default=str)[:20000], encoding="utf-8")
             self._sample_written = True
         except OSError:
             return
@@ -178,7 +205,7 @@ class Scanner:
             return
         self.db.upsert_coin(
             mint=mint,
-            pool=coin.get("pool"),
+            pool=None,
             migrated_at=coin.get("migratedAt"),
             creator=coin.get("creator"),
             creator_balance_at_migration=coin.get("creatorBalance"),
