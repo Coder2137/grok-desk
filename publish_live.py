@@ -1,7 +1,14 @@
-"""Publish encrypted live files to the live-data branch.
+"""Publish encrypted live files.
 
 Run this on the operator machine. It reads GH_TOKEN or GITHUB_TOKEN from the
 environment and does not print that token or DATA_PATH.
+
+live-data stays a ciphertext-only branch. pages-src is a real commit of main's
+tree with those ciphertext files under web/live. Pushing pages-src runs Pages.
+actions/deploy-pages uses that commit SHA as pages_build_version, so each
+snapshot is a new Pages version. Dispatching the workflow on main is not used:
+that reuses main's SHA, and GitHub Pages can report success while serving an
+older artifact for that same version.
 """
 
 import hashlib
@@ -17,9 +24,10 @@ import httpx
 from livecrypto import is_live_path
 
 LIVE_BRANCH = "live-data"
+PAGES_BRANCH = "pages-src"
+SOURCE_BRANCH = "main"
 COMMIT_MESSAGE = "Update live desk files"
-WORKFLOW_FILE = "pages.yml"
-DISPATCH_REF = "main"
+PAGES_MESSAGE = "Publish live snapshot"
 _CORE = ("state.json", "chart.json", "activity.json")
 _SECRET_ENV = (
     "DATA_PATH",
@@ -219,6 +227,12 @@ class GitHub:
                 files[item["path"]] = item["sha"]
         return files, bool(tree.get("truncated"))
 
+    def branch_tip(self, branch: str) -> str | None:
+        ref = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}", allow=(404,))
+        if ref.status_code == 404:
+            return None
+        return ref.json()["object"]["sha"]
+
     def commit_files(self, branch: str, files: dict[str, bytes], message: str) -> str:
         entries = [
             {
@@ -251,12 +265,51 @@ class GitHub:
             )
         return commit
 
-    def dispatch(self, workflow: str, ref: str) -> None:
-        self.request(
+    def commit_site(self, files: dict[str, bytes], live_sha: str) -> str:
+        """Commit main's tree plus web/live blobs on pages-src.
+
+        The blob SHAs are the live-data blobs already stored for this snapshot.
+        The new commit is a fast-forward of pages-src, or a child of main when
+        that branch does not exist yet. No workflow dispatch.
+        """
+        main_sha = self.branch_tip(SOURCE_BRANCH)
+        if not main_sha:
+            raise PublishError("main branch was not found")
+        main_commit = self.request("GET", f"/repos/{self.repo}/git/commits/{main_sha}").json()
+        entries = [
+            {
+                "path": f"web/live/{path}",
+                "mode": "100644",
+                "type": "blob",
+                "sha": git_blob_sha(files[path]),
+            }
+            for path in sorted(files)
+        ]
+        tree_sha = self.request(
             "POST",
-            f"/repos/{self.repo}/actions/workflows/{workflow}/dispatches",
-            {"ref": ref},
-        )
+            f"/repos/{self.repo}/git/trees",
+            {"base_tree": main_commit["tree"]["sha"], "tree": entries},
+        ).json()["sha"]
+        tip = self.branch_tip(PAGES_BRANCH)
+        parents = [tip or main_sha]
+        commit = self.request(
+            "POST",
+            f"/repos/{self.repo}/git/commits",
+            {"message": f"{PAGES_MESSAGE} {live_sha}", "tree": tree_sha, "parents": parents},
+        ).json()["sha"]
+        if tip:
+            self.request(
+                "PATCH",
+                f"/repos/{self.repo}/git/refs/heads/{PAGES_BRANCH}",
+                {"sha": commit, "force": False},
+            )
+        else:
+            self.request(
+                "POST",
+                f"/repos/{self.repo}/git/refs",
+                {"ref": f"refs/heads/{PAGES_BRANCH}", "sha": commit},
+            )
+        return commit
 
 
 def publish(root: Path, github: GitHub) -> str:
@@ -272,12 +325,16 @@ def publish(root: Path, github: GitHub) -> str:
     if not changed and not marker.is_file():
         return "unchanged"
     if changed:
-        github.commit_files(LIVE_BRANCH, files, COMMIT_MESSAGE)
+        live_sha = github.commit_files(LIVE_BRANCH, files, COMMIT_MESSAGE)
+    else:
+        live_sha = github.branch_tip(LIVE_BRANCH)
+        if not live_sha:
+            raise PublishError("live branch was not found")
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("1", encoding="utf-8")
-    github.dispatch(WORKFLOW_FILE, DISPATCH_REF)
+    github.commit_site(files, live_sha)
     marker.unlink(missing_ok=True)
-    return "updated" if changed else "dispatched"
+    return "updated" if changed else "published"
 
 
 def main() -> None:

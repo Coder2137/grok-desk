@@ -25,7 +25,7 @@ Set these in the environment or in a gitignored `.env`. Do not commit the values
 - `DESK_DB` — optional sqlite path. Default `var/desk.db`.
 - `JSON_ROOT` — optional. Default `var/json`.
 - `LIVE_ROOT` — optional. Default `var/live`. Encrypted envelopes for the public phone site.
-- `GH_TOKEN` — used only by `publish_live.py`. It needs permission to write the `live-data` branch and to dispatch the Pages workflow. `GITHUB_TOKEN` is read when `GH_TOKEN` is unset. Keep the token in the environment.
+- `GH_TOKEN` — used only by `publish_live.py`. It needs permission to push the `live-data` and `pages-src` branches. `GITHUB_TOKEN` is read when `GH_TOKEN` is unset. Keep the token in the environment.
 - `PAGES_URL` — optional public site, no secret path, used by the `report` command.
 - `LOCAL_API=1` — optional loopback server for the phone UI and `/api/health`.
 
@@ -49,11 +49,11 @@ The writer stores those envelopes under `var/live/` (or `LIVE_ROOT`). That direc
 python publish_live.py
 ```
 
-The script reads `GH_TOKEN` or `GITHUB_TOKEN` from the environment and updates the `live-data` branch so the branch contains only the encrypted files. It creates the branch when it is missing, then dispatches the Pages workflow. Run it about once a minute. A commit to `main` is not required for each refresh. Set `GITHUB_REPOSITORY` to `owner/name` when the checkout has no `origin` remote.
+The script reads `GH_TOKEN` or `GITHUB_TOKEN` from the environment. It updates `live-data` so that branch contains only the encrypted files, then adds a `pages-src` commit whose tree is current `main` with those files under `web/live`. Pushing `pages-src` runs the Pages workflow. `actions/deploy-pages` sends that commit's SHA as `pages_build_version`, which is the version GitHub Pages stores. Run the script about once a minute. A commit to `main` is not required for each refresh. Set `GITHUB_REPOSITORY` to `owner/name` when the checkout has no `origin` remote.
 
-The token needs permission to write the `live-data` branch and to dispatch workflows on this repository. Keep it in the operator environment.
+The token needs permission to push `live-data` and `pages-src`. It does not need permission to dispatch workflows. Keep it in the operator environment. Dispatching the Pages workflow on `main` reuses `main`'s SHA. A quiet dispatch of that kind uploaded a new artifact and reported success while the public site kept serving the older artifact for that same SHA. The script does not do that.
 
-GitHub Actions checks out `web/` from `main`, copies the `live-data` branch into `web/live/` when that branch exists, and deploys that site. The first deploy after merge already includes the encrypted snapshot in `web/live/`.
+On a push to `pages-src`, Actions checks out that commit and deploys it. On a push to `main`, Actions checks out that commit and copies the current `live-data` branch into `web/live/` before deploying. The first deploy after merge already includes the encrypted snapshot in `web/live/`.
 
 ## Fees
 

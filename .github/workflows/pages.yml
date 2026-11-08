@@ -2,7 +2,7 @@ name: Deploy GitHub Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "pages-src"]
   workflow_dispatch:
 
 permissions:
@@ -23,9 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: main
       - name: Overlay encrypted live files
+        if: github.ref == 'refs/heads/main'
         run: |
           if git ls-remote --exit-code --heads origin live-data >/dev/null; then
             git fetch --depth=1 origin live-data
