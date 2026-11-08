@@ -183,10 +183,12 @@ def test_load_live_files_rejects_plaintext(tmp_path):
 class _Api:
     def __init__(self) -> None:
         self.ref = None
-        self.commits = {}
-        self.trees = {}
-        self.dispatches = []
-        self.fail_dispatch = False
+        self.pages_ref = None
+        self.commits = {
+            "mainsha": {"tree": "maintree", "parents": [], "message": "main"},
+        }
+        self.trees = {"maintree": [{"path": "README.md", "mode": "100644", "type": "blob", "sha": git_blob_sha(b"readme")}]}
+        self.fail_pages = False
         self.bodies = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -199,10 +201,16 @@ class _Api:
         assert path.startswith(prefix)
         rest = path[len(prefix) :]
         body = json.loads(request.content) if request.content else {}
+        if request.method == "GET" and rest == "/git/ref/heads/main":
+            return httpx.Response(200, json={"object": {"sha": "mainsha", "type": "commit"}})
         if request.method == "GET" and rest == "/git/ref/heads/live-data":
             if self.ref is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json={"object": {"sha": self.ref, "type": "commit"}})
+        if request.method == "GET" and rest == "/git/ref/heads/pages-src":
+            if self.pages_ref is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"object": {"sha": self.pages_ref, "type": "commit"}})
         if request.method == "GET" and rest.startswith("/git/commits/"):
             sha = rest.rsplit("/", 1)[-1]
             commit = self.commits[sha]
@@ -213,13 +221,18 @@ class _Api:
         if request.method == "POST" and rest == "/git/trees":
             blobs = []
             for entry in body["tree"]:
-                content = entry["content"].encode("utf-8")
+                if "content" in entry:
+                    content = entry["content"].encode("utf-8")
+                    blob_sha = git_blob_sha(content)
+                else:
+                    blob_sha = entry["sha"]
+                    assert entry["path"].startswith("web/live/")
                 blobs.append(
                     {
                         "path": entry["path"],
                         "mode": "100644",
                         "type": "blob",
-                        "sha": git_blob_sha(content),
+                        "sha": blob_sha,
                     }
                 )
             tree_sha = f"tree{len(self.trees) + 1}"
@@ -230,18 +243,25 @@ class _Api:
             self.commits[sha] = {"tree": body["tree"], "parents": body["parents"], "message": body["message"]}
             return httpx.Response(201, json={"sha": sha})
         if request.method == "POST" and rest == "/git/refs":
-            assert body["ref"] == "refs/heads/live-data"
-            self.ref = body["sha"]
-            return httpx.Response(201, json={"ref": body["ref"], "object": {"sha": self.ref}})
+            if body["ref"] == "refs/heads/live-data":
+                self.ref = body["sha"]
+            elif body["ref"] == "refs/heads/pages-src":
+                if self.fail_pages:
+                    return httpx.Response(403, json={"message": f"denied {FIXTURE_TOKEN}"})
+                self.pages_ref = body["sha"]
+            else:
+                return httpx.Response(500, json={"message": "unexpected ref"})
+            return httpx.Response(201, json={"ref": body["ref"], "object": {"sha": body["sha"]}})
         if request.method == "PATCH" and rest == "/git/refs/heads/live-data":
             assert body["force"] is False
             self.ref = body["sha"]
             return httpx.Response(200, json={"object": {"sha": self.ref}})
-        if request.method == "POST" and rest == "/actions/workflows/pages.yml/dispatches":
-            if self.fail_dispatch:
+        if request.method == "PATCH" and rest == "/git/refs/heads/pages-src":
+            assert body["force"] is False
+            if self.fail_pages:
                 return httpx.Response(403, json={"message": f"denied {FIXTURE_TOKEN}"})
-            self.dispatches.append(body)
-            return httpx.Response(204)
+            self.pages_ref = body["sha"]
+            return httpx.Response(200, json={"object": {"sha": self.pages_ref}})
         return httpx.Response(500, json={"message": "unexpected"})
 
 
@@ -272,21 +292,31 @@ def test_publish_creates_branch_and_skips_unchanged(tmp_path, monkeypatch):
     github = _github(api)
     try:
         assert publish(root, github) == "updated"
-        assert api.dispatches == [{"ref": "main"}]
         first = api.ref
         assert api.commits[first]["message"] == COMMIT_MESSAGE
         assert api.commits[first]["parents"] == []
         paths = [item["path"] for item in api.trees[api.commits[first]["tree"]]]
         assert paths == ["activity.json", "chart.json", "coin/Mint111.json", "state.json"]
+        site = api.commits[api.pages_ref]
+        assert site["parents"] == ["mainsha"]
+        assert site["message"] == f"Publish live snapshot {first}"
+        site_paths = [item["path"] for item in api.trees[site["tree"]]]
+        assert site_paths == [
+            "web/live/activity.json",
+            "web/live/chart.json",
+            "web/live/coin/Mint111.json",
+            "web/live/state.json",
+        ]
         assert publish(root, github) == "unchanged"
         assert api.ref == first
-        assert len(api.dispatches) == 1
+        first_pages = api.pages_ref
         tree = api.trees[api.commits[first]["tree"]]
         tree.append({"path": "README.md", "mode": "100644", "type": "blob", "sha": git_blob_sha(b"hi\n")})
         assert publish(root, github) == "updated"
         new_paths = [item["path"] for item in api.trees[api.commits[api.ref]["tree"]]]
         assert "README.md" not in new_paths
         assert api.commits[api.ref]["parents"] == [first]
+        assert api.commits[api.pages_ref]["parents"] == [first_pages]
         blob = "\n".join(api.bodies)
         assert FIXTURE_DATA_PATH not in blob
         assert FIXTURE_TOKEN not in blob
@@ -294,12 +324,12 @@ def test_publish_creates_branch_and_skips_unchanged(tmp_path, monkeypatch):
         github.close()
 
 
-def test_publish_retries_dispatch_without_reprinting_the_token(tmp_path, monkeypatch):
+def test_publish_retries_pages_src_without_reprinting_the_token(tmp_path, monkeypatch):
     monkeypatch.setenv("GH_TOKEN", FIXTURE_TOKEN)
     root = tmp_path / "live"
     _envelopes(root)
     api = _Api()
-    api.fail_dispatch = True
+    api.fail_pages = True
     github = _github(api)
     try:
         with pytest.raises(GitHubError) as exc:
@@ -307,11 +337,13 @@ def test_publish_retries_dispatch_without_reprinting_the_token(tmp_path, monkeyp
         assert FIXTURE_TOKEN not in str(exc.value)
         assert "[redacted]" in str(exc.value)
         assert (tmp_path / "live.dispatch-pending").is_file()
-        api.fail_dispatch = False
-        assert publish(root, github) == "dispatched"
+        live_commits = [sha for sha in api.commits if sha != "mainsha" and api.commits[sha]["parents"] == []]
+        api.fail_pages = False
+        assert publish(root, github) == "published"
         assert not (tmp_path / "live.dispatch-pending").is_file()
-        assert len(api.commits) == 1
-        assert api.dispatches == [{"ref": "main"}]
+        assert api.pages_ref
+        assert api.commits[api.pages_ref]["parents"] == ["mainsha"]
+        assert live_commits == [api.ref]
     finally:
         github.close()
 
@@ -373,17 +405,22 @@ def test_github_client_does_not_follow_redirects():
 
 def test_pages_workflow_publishes_web_and_live_without_listing_secret_paths():
     text = (ROOT / ".github" / "workflows" / "pages.yml").read_text(encoding="utf-8")
-    assert "workflow_dispatch" in text
-    assert "ref: main" in text
+    assert "pages-src" in text
+    assert "refs/heads/main" in text
     assert "live-data" in text
     assert "web/live" in text
     assert "path: web" in text
+    assert "ref: main" not in text
+    assert "GITHUB_SHA" not in text
+    assert "artifact_id" not in text
     assert "/d/" not in text
     assert "DATA_PATH" not in text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "publish_live.py" in readme
     assert "GH_TOKEN" in readme
     assert "live-data" in readme
+    assert "pages-src" in readme
+    assert "pages_build_version" in readme
     assert "var/live" in readme
     assert "ghp_" not in readme
     assert "github_pat_" not in readme
