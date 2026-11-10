@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -28,6 +29,11 @@ PAGES_BRANCH = "pages-src"
 SOURCE_BRANCH = "main"
 COMMIT_MESSAGE = "Update live desk files"
 PAGES_MESSAGE = "Publish live snapshot"
+_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+_ATTEMPTS = 4
+_BACKOFF_S = (2, 4, 8)
+# Four attempts plus the backoff stays under the 120s launcher limit.
+_ATTEMPT_TIMEOUT_S = 20.0
 _CORE = ("state.json", "chart.json", "activity.json")
 _SECRET_ENV = (
     "DATA_PATH",
@@ -164,13 +170,14 @@ def same_files(files: dict[str, bytes], remote: dict[str, str] | None, truncated
 
 
 class GitHub:
-    def __init__(self, token: str, repo: str, client: httpx.Client | None = None) -> None:
+    def __init__(self, token: str, repo: str, client: httpx.Client | None = None, sleep=None) -> None:
         self.repo = repo
         self._token = token
+        self._sleep = sleep or time.sleep
         self._owned = client is None
         self._client = client or httpx.Client(
             base_url="https://api.github.com",
-            timeout=30.0,
+            timeout=_ATTEMPT_TIMEOUT_S,
             follow_redirects=False,
         )
 
@@ -190,28 +197,64 @@ class GitHub:
     def _redact(self, text: str) -> str:
         return redact(text, self._token)
 
-    def request(self, method: str, path: str, body: dict | None = None, allow: tuple[int, ...] = ()) -> httpx.Response:
-        response = self._client.request(
-            method,
-            path,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {self._token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "grok-desk-publish",
-            },
-        )
-        if response.status_code >= 400 and response.status_code not in allow:
+    def _error_message(self, response: httpx.Response) -> str:
+        message = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                message = str(payload.get("message") or "")
+        except Exception:
             message = ""
+        return self._redact(message)
+
+    def _ref_already(self, path: str, sha: str) -> bool:
+        ref = self.request("GET", path, allow=(404,))
+        if ref.status_code != 200:
+            return False
+        try:
+            return ref.json()["object"]["sha"] == sha
+        except Exception:
+            return False
+
+    def request(self, method: str, path: str, body: dict | None = None, allow: tuple[int, ...] = ()) -> httpx.Response:
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "grok-desk-publish",
+        }
+        for attempt in range(_ATTEMPTS):
             try:
-                payload = response.json()
-                if isinstance(payload, dict):
-                    message = str(payload.get("message") or "")
-            except Exception:
-                message = ""
-            raise GitHubError(response.status_code, self._redact(message))
-        return response
+                response = self._client.request(
+                    method,
+                    path,
+                    json=body,
+                    headers=headers,
+                    timeout=_ATTEMPT_TIMEOUT_S,
+                )
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                if attempt + 1 >= _ATTEMPTS:
+                    raise GitHubError(0, self._redact(exc.__class__.__name__)) from None
+                self._sleep(_BACKOFF_S[attempt])
+                continue
+            if response.status_code in _RETRY_STATUSES and response.status_code not in allow:
+                if attempt + 1 >= _ATTEMPTS:
+                    raise GitHubError(response.status_code, self._error_message(response))
+                self._sleep(_BACKOFF_S[attempt])
+                continue
+            if (
+                response.status_code == 422
+                and method == "PATCH"
+                and "/git/refs/" in path
+                and body
+                and body.get("sha")
+                and self._ref_already(path, str(body["sha"]))
+            ):
+                return httpx.Response(200, json={"object": {"sha": body["sha"]}})
+            if response.status_code >= 400 and response.status_code not in allow:
+                raise GitHubError(response.status_code, self._error_message(response))
+            return response
+        raise GitHubError(0, "retry exhausted")
 
     def branch_state(self, branch: str) -> tuple[dict[str, str] | None, bool]:
         ref = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}", allow=(404,))

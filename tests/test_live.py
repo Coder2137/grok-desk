@@ -424,3 +424,112 @@ def test_pages_workflow_publishes_web_and_live_without_listing_secret_paths():
     assert "var/live" in readme
     assert "ghp_" not in readme
     assert "github_pat_" not in readme
+
+
+def _retry_github(handler, sleeps):
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.github.com")
+    return GitHub(FIXTURE_TOKEN, "example/desk", client=client, sleep=sleeps.append)
+
+
+def test_request_retries_502_then_succeeds():
+    calls = {"n": 0}
+    sleeps = []
+
+    def handler(_request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(502, json={"message": f"Server Error {FIXTURE_TOKEN}"})
+        return httpx.Response(200, json={"ok": True})
+
+    github = _retry_github(handler, sleeps)
+    try:
+        response = github.request("GET", "/repos/example/desk/git/ref/heads/main")
+        assert response.status_code == 200
+        assert calls["n"] == 2
+        assert sleeps == [2]
+        assert FIXTURE_TOKEN not in "".join(str(item) for item in sleeps)
+    finally:
+        github.close()
+
+
+def test_request_raises_after_four_502s():
+    calls = {"n": 0}
+    sleeps = []
+
+    def handler(_request):
+        calls["n"] += 1
+        return httpx.Response(502, json={"message": f"Server Error {FIXTURE_TOKEN}"})
+
+    github = _retry_github(handler, sleeps)
+    try:
+        with pytest.raises(GitHubError) as exc:
+            github.request("POST", "/repos/example/desk/git/commits", {"message": "x"})
+        assert exc.value.status == 502
+        assert calls["n"] == 4
+        assert sleeps == [2, 4, 8]
+        assert FIXTURE_TOKEN not in str(exc.value)
+    finally:
+        github.close()
+
+
+def test_request_does_not_retry_404():
+    calls = {"n": 0}
+    sleeps = []
+
+    def handler(_request):
+        calls["n"] += 1
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    github = _retry_github(handler, sleeps)
+    try:
+        with pytest.raises(GitHubError) as exc:
+            github.request("GET", "/repos/example/desk/git/ref/heads/missing")
+        assert exc.value.status == 404
+        assert calls["n"] == 1
+        assert sleeps == []
+    finally:
+        github.close()
+
+
+def test_request_retries_transport_error_then_succeeds():
+    calls = {"n": 0}
+    sleeps = []
+
+    def handler(_request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection dropped")
+        return httpx.Response(200, json={"ok": True})
+
+    github = _retry_github(handler, sleeps)
+    try:
+        response = github.request("GET", "/repos/example/desk/git/ref/heads/main")
+        assert response.status_code == 200
+        assert calls["n"] == 2
+        assert sleeps == [2]
+    finally:
+        github.close()
+
+
+def test_patch_422_is_success_when_the_tip_matches():
+    calls = []
+    sleeps = []
+
+    def handler(request):
+        calls.append(request.method)
+        if request.method == "PATCH":
+            return httpx.Response(422, json={"message": "Reference cannot be updated"})
+        return httpx.Response(200, json={"object": {"sha": "abc"}})
+
+    github = _retry_github(handler, sleeps)
+    try:
+        response = github.request(
+            "PATCH",
+            "/repos/example/desk/git/refs/heads/pages-src",
+            {"sha": "abc", "force": False},
+        )
+        assert response.status_code == 200
+        assert calls == ["PATCH", "GET"]
+        assert sleeps == []
+    finally:
+        github.close()
