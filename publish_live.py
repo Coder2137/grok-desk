@@ -17,8 +17,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -35,6 +37,8 @@ _ATTEMPTS = 4
 _BACKOFF_S = (2, 4, 8)
 # Four attempts plus the backoff stays under the 120s launcher limit.
 _ATTEMPT_TIMEOUT_S = 20.0
+# Blob uploads are the slow part of a catch-up. Eight at a time keeps ~1000 files under the launcher limit.
+_BLOB_WORKERS = 8
 _CORE = ("state.json", "chart.json", "activity.json")
 _SECRET_ENV = (
     "DATA_PATH",
@@ -174,6 +178,8 @@ class GitHub:
         self.repo = repo
         self._token = token
         self._sleep = sleep or time.sleep
+        self._blobs: dict[str, str] = {}
+        self._blob_lock = threading.Lock()
         self._owned = client is None
         self._client = client or httpx.Client(
             base_url="https://api.github.com",
@@ -279,12 +285,20 @@ class GitHub:
         return ref.json()["object"]["sha"]
 
     def create_blob(self, content: bytes) -> str:
+        digest = git_blob_sha(content)
+        with self._blob_lock:
+            cached = self._blobs.get(digest)
+        if cached:
+            return cached
         created = self.request(
             "POST",
             f"/repos/{self.repo}/git/blobs",
             {"content": content.decode("utf-8"), "encoding": "utf-8"},
         ).json()
-        return str(created["sha"])
+        sha = str(created["sha"])
+        with self._blob_lock:
+            self._blobs[digest] = sha
+        return sha
 
     def _tree_blobs(self, tree_sha: str) -> dict[str, str]:
         files, _truncated = self._read_tree(tree_sha)
@@ -299,20 +313,26 @@ class GitHub:
         return files, bool(tree.get("truncated"))
 
     def _changed_entries(self, files: dict[str, bytes], remote: dict[str, str], prefix: str = "") -> list[dict]:
-        entries = []
+        pending = []
         for path in sorted(files):
             full = f"{prefix}{path}"
             if remote.get(full) == git_blob_sha(files[path]):
                 continue
-            entries.append(
-                {
-                    "path": full,
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": self.create_blob(files[path]),
-                }
-            )
-        return entries
+            pending.append((full, files[path]))
+        if not pending:
+            return []
+
+        def upload(item: tuple[str, bytes]) -> dict:
+            full, content = item
+            return {
+                "path": full,
+                "mode": "100644",
+                "type": "blob",
+                "sha": self.create_blob(content),
+            }
+
+        with ThreadPoolExecutor(max_workers=_BLOB_WORKERS) as pool:
+            return list(pool.map(upload, pending))
 
     def _commit_tree(self, branch: str, message: str, files: dict[str, bytes], prefix: str = "", base: str | None = None) -> str:
         """Commit `files` onto `branch`, inheriting unchanged paths from its tip.

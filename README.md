@@ -43,7 +43,7 @@ FOMO URLs are built only in `links.py`.
 
 ## Live branch
 
-The writer stores those envelopes under `var/live/` (or `LIVE_ROOT`). That directory stays on the operator machine.
+The writer stores those envelopes under `var/live/` (or `LIVE_ROOT`). That directory stays on the operator machine. It also writes `var/live/.plain-hashes.json`, a map of sha256 hashes of the plaintext, and skips re-encrypting a file whose plaintext did not change. That file is not published and holds no plaintext and no key. Leave it in place across restarts.
 
 ```bash
 python publish_live.py
