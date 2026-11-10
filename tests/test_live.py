@@ -190,6 +190,8 @@ class _Api:
         self.trees = {"maintree": [{"path": "README.md", "mode": "100644", "type": "blob", "sha": git_blob_sha(b"readme")}]}
         self.fail_pages = False
         self.bodies = []
+        self.tree_posts = []
+        self.blob_posts = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == f"Bearer {FIXTURE_TOKEN}"
@@ -218,25 +220,27 @@ class _Api:
         if request.method == "GET" and rest.startswith("/git/trees/"):
             sha = rest.rsplit("/", 1)[-1]
             return httpx.Response(200, json={"sha": sha, "tree": self.trees[sha], "truncated": False})
+        if request.method == "POST" and rest == "/git/blobs":
+            assert body.get("encoding") == "utf-8"
+            content = body["content"].encode("utf-8")
+            self.blob_posts.append(content)
+            return httpx.Response(201, json={"sha": git_blob_sha(content)})
         if request.method == "POST" and rest == "/git/trees":
-            blobs = []
+            self.tree_posts.append(body)
+            merged = {}
+            if body.get("base_tree"):
+                for item in self.trees[body["base_tree"]]:
+                    merged[item["path"]] = dict(item)
             for entry in body["tree"]:
-                if "content" in entry:
-                    content = entry["content"].encode("utf-8")
-                    blob_sha = git_blob_sha(content)
-                else:
-                    blob_sha = entry["sha"]
-                    assert entry["path"].startswith("web/live/")
-                blobs.append(
-                    {
-                        "path": entry["path"],
-                        "mode": "100644",
-                        "type": "blob",
-                        "sha": blob_sha,
-                    }
-                )
+                assert "content" not in entry
+                merged[entry["path"]] = {
+                    "path": entry["path"],
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": entry["sha"],
+                }
             tree_sha = f"tree{len(self.trees) + 1}"
-            self.trees[tree_sha] = blobs
+            self.trees[tree_sha] = [merged[path] for path in sorted(merged)]
             return httpx.Response(201, json={"sha": tree_sha})
         if request.method == "POST" and rest == "/git/commits":
             sha = f"commit{len(self.commits) + 1}"
@@ -302,6 +306,7 @@ def test_publish_creates_branch_and_skips_unchanged(tmp_path, monkeypatch):
         assert site["message"] == f"Publish live snapshot {first}"
         site_paths = [item["path"] for item in api.trees[site["tree"]]]
         assert site_paths == [
+            "README.md",
             "web/live/activity.json",
             "web/live/chart.json",
             "web/live/coin/Mint111.json",
@@ -309,12 +314,18 @@ def test_publish_creates_branch_and_skips_unchanged(tmp_path, monkeypatch):
         ]
         assert publish(root, github) == "unchanged"
         assert api.ref == first
-        first_pages = api.pages_ref
         tree = api.trees[api.commits[first]["tree"]]
         tree.append({"path": "README.md", "mode": "100644", "type": "blob", "sha": git_blob_sha(b"hi\n")})
+        assert publish(root, github) == "unchanged"
+        assert api.ref == first
+        first_pages = api.pages_ref
+        (root / "state.json").write_bytes(
+            envelope_bytes(encrypt_envelope(b'{"balance":2}', FIXTURE_DATA_PATH, "state.json", nonce=bytes(range(12))))
+        )
         assert publish(root, github) == "updated"
         new_paths = [item["path"] for item in api.trees[api.commits[api.ref]["tree"]]]
-        assert "README.md" not in new_paths
+        assert "README.md" in new_paths
+        assert "coin/Mint111.json" in new_paths
         assert api.commits[api.ref]["parents"] == [first]
         assert api.commits[api.pages_ref]["parents"] == [first_pages]
         blob = "\n".join(api.bodies)
@@ -531,5 +542,69 @@ def test_patch_422_is_success_when_the_tip_matches():
         assert response.status_code == 200
         assert calls == ["PATCH", "GET"]
         assert sleeps == []
+    finally:
+        github.close()
+
+
+def test_request_retries_422_at_most_once():
+    sleeps = []
+    calls = {"n": 0}
+
+    def handler(_request):
+        calls["n"] += 1
+        return httpx.Response(
+            422,
+            json={"message": f"Sorry, your request timed out. It's likely that your input was too large. {FIXTURE_TOKEN}"},
+        )
+
+    github = _retry_github(handler, sleeps)
+    try:
+        with pytest.raises(GitHubError) as exc:
+            github.request("POST", "/repos/example/desk/git/trees", {"tree": []})
+        assert exc.value.status == 422
+        assert calls["n"] == 2
+        assert sleeps == [2]
+        assert FIXTURE_TOKEN not in str(exc.value)
+    finally:
+        github.close()
+
+
+def test_publish_sends_only_changed_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_PATH", FIXTURE_DATA_PATH)
+    root = tmp_path / "live"
+    _envelopes(root)
+    nonce = bytes(range(12))
+    for index in range(1000):
+        name = f"coin/Coin{index:04d}.json"
+        raw = f'{{"i":{index}}}'.encode()
+        (root / name).write_bytes(envelope_bytes(encrypt_envelope(raw, FIXTURE_DATA_PATH, name, nonce=nonce)))
+    api = _Api()
+    github = _github(api)
+    try:
+        assert publish(root, github) == "updated"
+        kept = root / "coin" / "Coin0000.json"
+        kept.unlink()
+        api.tree_posts.clear()
+        api.blob_posts.clear()
+        for name in ("state.json", "chart.json", "activity.json"):
+            (root / name).write_bytes(
+                envelope_bytes(encrypt_envelope(b'{"changed":true}', FIXTURE_DATA_PATH, name, nonce=nonce))
+            )
+        assert publish(root, github) == "updated"
+        assert [len(body["tree"]) for body in api.tree_posts] == [3, 3]
+        assert all(body.get("base_tree") for body in api.tree_posts)
+        sent = sorted(entry["path"] for body in api.tree_posts for entry in body["tree"])
+        assert sent == [
+            "activity.json",
+            "chart.json",
+            "state.json",
+            "web/live/activity.json",
+            "web/live/chart.json",
+            "web/live/state.json",
+        ]
+        assert len(api.blob_posts) == 6
+        live_paths = [item["path"] for item in api.trees[api.commits[api.ref]["tree"]]]
+        assert "coin/Coin0000.json" in live_paths
+        assert sum(path.startswith("coin/") for path in live_paths) == 1001
     finally:
         github.close()
