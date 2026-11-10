@@ -1,18 +1,21 @@
+import hashlib
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import httpx
 import pytest
 from cryptography.exceptions import InvalidTag
 
-from api import Writer
+from api import PLAIN_HASHES, Writer
 from bus import Bus
 from config import DeskSettings, iso, utc_now
 from db import Database
 from livecrypto import decrypt_envelope, encrypt_envelope, envelope_bytes, is_live_path
 from publish_live import (
     COMMIT_MESSAGE,
+    _BLOB_WORKERS,
     GitHub,
     GitHubError,
     PublishError,
@@ -142,6 +145,50 @@ def test_writer_skips_without_a_long_path(tmp_path, monkeypatch):
         db.close()
 
 
+def test_writer_skips_unchanged_coin_envelopes_across_restarts(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_PATH", FIXTURE_DATA_PATH)
+    monkeypatch.setenv("JSON_ROOT", str(tmp_path / "json"))
+    monkeypatch.setenv("LIVE_ROOT", str(tmp_path / "live"))
+    db = Database(tmp_path / "desk.db")
+    try:
+        settings = DeskSettings(db)
+        mint = "ReplayMint1111111111111111111111111"
+        name = f"coin/{mint}.json"
+        db.add_audit_layer(mint, iso(utc_now()), 1, "mint", "ok", 1, "test")
+        Writer(db, settings, Bus()).write_all()
+        live = tmp_path / "live" / name
+        plain = tmp_path / "json" / "d" / FIXTURE_DATA_PATH / name
+        first = live.read_bytes()
+        stamp = live.stat().st_mtime_ns
+        plain_stamp = plain.stat().st_mtime_ns
+        Writer(db, settings, Bus()).write_all()
+        assert live.read_bytes() == first
+        assert live.stat().st_mtime_ns == stamp
+        assert plain.stat().st_mtime_ns == plain_stamp
+        Writer(db, settings, Bus()).write_all()
+        assert live.read_bytes() == first
+        assert live.stat().st_mtime_ns == stamp
+        sidecar = tmp_path / "live" / PLAIN_HASHES
+        text = sidecar.read_text(encoding="utf-8")
+        assert FIXTURE_DATA_PATH not in text
+        assert plain.read_text(encoding="utf-8") not in text
+        stored = json.loads(text)
+        assert stored[name] == hashlib.sha256(plain.read_bytes()).hexdigest()
+        assert all(len(value) == 64 for value in stored.values())
+        assert not is_live_path(PLAIN_HASHES)
+        published = load_live_files(tmp_path / "live")
+        assert PLAIN_HASHES not in published
+        assert published[name] == first
+        db.upsert_coin(mint=mint, name="Changed", symbol="CHG")
+        Writer(db, settings, Bus()).write_all()
+        rewritten = live.read_bytes()
+        assert rewritten != first
+        assert live.stat().st_mtime_ns != stamp
+        assert json.loads(decrypt_envelope(json.loads(rewritten), FIXTURE_DATA_PATH, name))["name"] == "Changed"
+    finally:
+        db.close()
+
+
 def test_blob_sha_matches_git(tmp_path):
     content = b'{"v":1}\n'
     path = tmp_path / "blob.json"
@@ -192,12 +239,14 @@ class _Api:
         self.bodies = []
         self.tree_posts = []
         self.blob_posts = []
+        self._lock = threading.Lock()
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == f"Bearer {FIXTURE_TOKEN}"
         assert FIXTURE_TOKEN not in str(request.url)
         if request.content:
-            self.bodies.append(request.content.decode("utf-8"))
+            with self._lock:
+                self.bodies.append(request.content.decode("utf-8"))
         path = request.url.path
         prefix = "/repos/example/desk"
         assert path.startswith(prefix)
@@ -223,7 +272,8 @@ class _Api:
         if request.method == "POST" and rest == "/git/blobs":
             assert body.get("encoding") == "utf-8"
             content = body["content"].encode("utf-8")
-            self.blob_posts.append(content)
+            with self._lock:
+                self.blob_posts.append(content)
             return httpx.Response(201, json={"sha": git_blob_sha(content)})
         if request.method == "POST" and rest == "/git/trees":
             self.tree_posts.append(body)
@@ -602,9 +652,44 @@ def test_publish_sends_only_changed_files(tmp_path, monkeypatch):
             "web/live/chart.json",
             "web/live/state.json",
         ]
-        assert len(api.blob_posts) == 6
+        assert len(api.blob_posts) == 3
         live_paths = [item["path"] for item in api.trees[api.commits[api.ref]["tree"]]]
         assert "coin/Coin0000.json" in live_paths
         assert sum(path.startswith("coin/") for path in live_paths) == 1001
+    finally:
+        github.close()
+
+
+def test_changed_blobs_upload_on_a_bounded_pool():
+    inflight = {"n": 0, "max": 0, "arrived": 0}
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/git/blobs")
+        with lock:
+            inflight["n"] += 1
+            inflight["max"] = max(inflight["max"], inflight["n"])
+            inflight["arrived"] += 1
+            if inflight["arrived"] >= _BLOB_WORKERS:
+                release.set()
+        assert release.wait(timeout=2)
+        with lock:
+            inflight["n"] -= 1
+        body = json.loads(request.content)
+        content = body["content"].encode("utf-8")
+        return httpx.Response(201, json={"sha": git_blob_sha(content)})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.github.com")
+    github = GitHub(FIXTURE_TOKEN, "example/desk", client=client)
+    try:
+        files = {f"coin/M{index:02d}.json": f'{{"i":{index}}}'.encode() for index in range(16)}
+        unchanged = files["coin/M00.json"]
+        remote = {"coin/M00.json": git_blob_sha(unchanged)}
+        entries = github._changed_entries(files, remote)
+        assert len(entries) == 15
+        assert [item["path"] for item in entries] == sorted(path for path in files if path != "coin/M00.json")
+        assert inflight["max"] == _BLOB_WORKERS
+        assert {item["sha"] for item in entries} == {git_blob_sha(files[item["path"]]) for item in entries}
     finally:
         github.close()

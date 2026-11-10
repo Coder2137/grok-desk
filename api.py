@@ -5,6 +5,7 @@ Nothing in this module reads a token out of the repository. Bare /d/ is not crea
 """
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -63,6 +64,9 @@ def live_root() -> Path:
     return Path(os.environ.get("LIVE_ROOT") or "var/live")
 
 
+PLAIN_HASHES = ".plain-hashes.json"
+
+
 def _under(root: Path, relative: str) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     path = root
@@ -82,13 +86,48 @@ def _write_bytes(path: Path, raw: bytes) -> None:
     temporary.replace(path)
 
 
-def _emit(relative: str, payload, plain_root: Path, secret: str) -> None:
+def _plain_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _hash_ok(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def load_plain_hashes() -> dict[str, str]:
+    path = live_root() / PLAIN_HASHES
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    found = {}
+    for key, value in payload.items():
+        if isinstance(key, str) and is_live_path(key) and _hash_ok(value):
+            found[key] = value
+    return found
+
+
+def save_plain_hashes(hashes: dict[str, str]) -> None:
+    clean = {key: value for key, value in sorted(hashes.items()) if is_live_path(key) and _hash_ok(value)}
+    _write_bytes(live_root() / PLAIN_HASHES, json.dumps(clean, separators=(",", ":")).encode("utf-8"))
+
+
+def _emit(relative: str, payload, plain_root: Path, secret: str, hashes: dict[str, str]) -> str | None:
     if not is_live_path(relative):
-        return
+        return None
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    digest = _plain_digest(raw)
+    plain_path = _under(plain_root, relative)
+    live_path = _under(live_root(), relative)
+    if hashes.get(relative) == digest and plain_path.is_file() and live_path.is_file():
+        return relative
     envelope = envelope_bytes(encrypt_envelope(raw, secret, relative))
-    _write_bytes(_under(plain_root, relative), raw)
-    _write_bytes(_under(live_root(), relative), envelope)
+    _write_bytes(plain_path, raw)
+    _write_bytes(live_path, envelope)
+    hashes[relative] = digest
+    return relative
 
 
 def _public_rpc(url: str) -> str:
@@ -483,16 +522,33 @@ class Writer:
             return
         equity = _equity(self.db, self.settings)
         self.db.add_balance(equity)
-        _emit("state.json", build_state(self.db, self.settings), root, secret)
-        _emit("chart.json", build_chart(self.db, self.settings), root, secret)
-        _emit("activity.json", build_activity(self.db), root, secret)
+        hashes = load_plain_hashes()
+        before = dict(hashes)
+        kept: set[str] = set()
+        snapshots = (
+            ("state.json", build_state(self.db, self.settings)),
+            ("chart.json", build_chart(self.db, self.settings)),
+            ("activity.json", build_activity(self.db)),
+        )
+        for relative, payload in snapshots:
+            name = _emit(relative, payload, root, secret, hashes)
+            if name:
+                kept.add(name)
         for mint in self._screen_mints():
-            _emit(
+            name = _emit(
                 f"coin/{mint}.json",
                 build_coin(self.db, self.settings, mint, self.bus.market.get(mint)),
                 root,
                 secret,
+                hashes,
             )
+            if name:
+                kept.add(name)
+        for key in list(hashes):
+            if key not in kept:
+                hashes.pop(key, None)
+        if hashes != before:
+            save_plain_hashes(hashes)
 
     def _screen_mints(self) -> list[str]:
         since = self.settings.get("desk.night_start") or "1970"
