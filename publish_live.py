@@ -3,8 +3,9 @@
 Run this on the operator machine. It reads GH_TOKEN or GITHUB_TOKEN from the
 environment and does not print that token or DATA_PATH.
 
-live-data stays a ciphertext-only branch. pages-src is a real commit of main's
-tree with those ciphertext files under web/live. Pushing pages-src runs Pages.
+live-data stays a ciphertext-only branch. pages-src starts from main, then each
+later commit keeps that tree and replaces only the web/live blobs that changed.
+Pushing pages-src runs Pages.
 actions/deploy-pages uses that commit SHA as pages_build_version, so each
 snapshot is a new Pages version. Dispatching the workflow on main is not used:
 that reuses main's SHA, and GitHub Pages can report success while serving an
@@ -16,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -28,6 +30,11 @@ PAGES_BRANCH = "pages-src"
 SOURCE_BRANCH = "main"
 COMMIT_MESSAGE = "Update live desk files"
 PAGES_MESSAGE = "Publish live snapshot"
+_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+_ATTEMPTS = 4
+_BACKOFF_S = (2, 4, 8)
+# Four attempts plus the backoff stays under the 120s launcher limit.
+_ATTEMPT_TIMEOUT_S = 20.0
 _CORE = ("state.json", "chart.json", "activity.json")
 _SECRET_ENV = (
     "DATA_PATH",
@@ -158,19 +165,19 @@ def _reject_secret_material(files: dict[str, bytes]) -> None:
 def same_files(files: dict[str, bytes], remote: dict[str, str] | None, truncated: bool) -> bool:
     if remote is None or truncated:
         return False
-    if set(files) != set(remote):
-        return False
-    return all(git_blob_sha(content) == remote[path] for path, content in files.items())
+    # Extra files on the branch are kept. A publish is due only when a local file is new or its blob changed.
+    return all(remote.get(path) == git_blob_sha(content) for path, content in files.items())
 
 
 class GitHub:
-    def __init__(self, token: str, repo: str, client: httpx.Client | None = None) -> None:
+    def __init__(self, token: str, repo: str, client: httpx.Client | None = None, sleep=None) -> None:
         self.repo = repo
         self._token = token
+        self._sleep = sleep or time.sleep
         self._owned = client is None
         self._client = client or httpx.Client(
             base_url="https://api.github.com",
-            timeout=30.0,
+            timeout=_ATTEMPT_TIMEOUT_S,
             follow_redirects=False,
         )
 
@@ -190,28 +197,72 @@ class GitHub:
     def _redact(self, text: str) -> str:
         return redact(text, self._token)
 
-    def request(self, method: str, path: str, body: dict | None = None, allow: tuple[int, ...] = ()) -> httpx.Response:
-        response = self._client.request(
-            method,
-            path,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {self._token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "grok-desk-publish",
-            },
-        )
-        if response.status_code >= 400 and response.status_code not in allow:
+    def _error_message(self, response: httpx.Response) -> str:
+        message = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                message = str(payload.get("message") or "")
+        except Exception:
             message = ""
+        return self._redact(message)
+
+    def _ref_already(self, path: str, sha: str) -> bool:
+        ref = self.request("GET", path, allow=(404,))
+        if ref.status_code != 200:
+            return False
+        try:
+            return ref.json()["object"]["sha"] == sha
+        except Exception:
+            return False
+
+    def request(self, method: str, path: str, body: dict | None = None, allow: tuple[int, ...] = ()) -> httpx.Response:
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "grok-desk-publish",
+        }
+        retried_422 = False
+        for attempt in range(_ATTEMPTS):
             try:
-                payload = response.json()
-                if isinstance(payload, dict):
-                    message = str(payload.get("message") or "")
-            except Exception:
-                message = ""
-            raise GitHubError(response.status_code, self._redact(message))
-        return response
+                response = self._client.request(
+                    method,
+                    path,
+                    json=body,
+                    headers=headers,
+                    timeout=_ATTEMPT_TIMEOUT_S,
+                )
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                if attempt + 1 >= _ATTEMPTS:
+                    raise GitHubError(0, self._redact(exc.__class__.__name__)) from None
+                self._sleep(_BACKOFF_S[attempt])
+                continue
+            if response.status_code in _RETRY_STATUSES and response.status_code not in allow:
+                if attempt + 1 >= _ATTEMPTS:
+                    raise GitHubError(response.status_code, self._error_message(response))
+                self._sleep(_BACKOFF_S[attempt])
+                continue
+            if (
+                response.status_code == 422
+                and method == "PATCH"
+                and "/git/refs/" in path
+                and body
+                and body.get("sha")
+                and self._ref_already(path, str(body["sha"]))
+            ):
+                return httpx.Response(200, json={"object": {"sha": body["sha"]}})
+            # A too-large tree times out as 422. One retry covers a transient timeout; a second 422 is final.
+            if response.status_code == 422 and response.status_code not in allow:
+                if retried_422 or attempt + 1 >= _ATTEMPTS:
+                    raise GitHubError(response.status_code, self._error_message(response))
+                retried_422 = True
+                self._sleep(_BACKOFF_S[attempt])
+                continue
+            if response.status_code >= 400 and response.status_code not in allow:
+                raise GitHubError(response.status_code, self._error_message(response))
+            return response
+        raise GitHubError(0, "retry exhausted")
 
     def branch_state(self, branch: str) -> tuple[dict[str, str] | None, bool]:
         ref = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}", allow=(404,))
@@ -219,13 +270,7 @@ class GitHub:
             return None, False
         sha = ref.json()["object"]["sha"]
         commit = self.request("GET", f"/repos/{self.repo}/git/commits/{sha}").json()
-        tree_sha = commit["tree"]["sha"]
-        tree = self.request("GET", f"/repos/{self.repo}/git/trees/{tree_sha}?recursive=1").json()
-        files = {}
-        for item in tree.get("tree") or []:
-            if item.get("type") == "blob" and item.get("path"):
-                files[item["path"]] = item["sha"]
-        return files, bool(tree.get("truncated"))
+        return self._read_tree(commit["tree"]["sha"])
 
     def branch_tip(self, branch: str) -> str | None:
         ref = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}", allow=(404,))
@@ -233,25 +278,77 @@ class GitHub:
             return None
         return ref.json()["object"]["sha"]
 
-    def commit_files(self, branch: str, files: dict[str, bytes], message: str) -> str:
-        entries = [
-            {
-                "path": path,
-                "mode": "100644",
-                "type": "blob",
-                "content": files[path].decode("utf-8"),
-            }
-            for path in sorted(files)
-        ]
-        tree_sha = self.request("POST", f"/repos/{self.repo}/git/trees", {"tree": entries}).json()["sha"]
+    def create_blob(self, content: bytes) -> str:
+        created = self.request(
+            "POST",
+            f"/repos/{self.repo}/git/blobs",
+            {"content": content.decode("utf-8"), "encoding": "utf-8"},
+        ).json()
+        return str(created["sha"])
+
+    def _tree_blobs(self, tree_sha: str) -> dict[str, str]:
+        files, _truncated = self._read_tree(tree_sha)
+        return files
+
+    def _read_tree(self, tree_sha: str) -> tuple[dict[str, str], bool]:
+        tree = self.request("GET", f"/repos/{self.repo}/git/trees/{tree_sha}?recursive=1").json()
+        files = {}
+        for item in tree.get("tree") or []:
+            if item.get("type") == "blob" and item.get("path"):
+                files[item["path"]] = item["sha"]
+        return files, bool(tree.get("truncated"))
+
+    def _changed_entries(self, files: dict[str, bytes], remote: dict[str, str], prefix: str = "") -> list[dict]:
+        entries = []
+        for path in sorted(files):
+            full = f"{prefix}{path}"
+            if remote.get(full) == git_blob_sha(files[path]):
+                continue
+            entries.append(
+                {
+                    "path": full,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": self.create_blob(files[path]),
+                }
+            )
+        return entries
+
+    def _commit_tree(self, branch: str, message: str, files: dict[str, bytes], prefix: str = "", base: str | None = None) -> str:
+        """Commit `files` onto `branch`, inheriting unchanged paths from its tip.
+
+        `base` is the commit to start from when `branch` does not exist yet.
+        Changed files are uploaded one blob at a time and referenced by sha.
+        Paths missing locally are left in the tree.
+        """
         ref = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}", allow=(404,))
-        parents = [] if ref.status_code == 404 else [ref.json()["object"]["sha"]]
+        parents: list[str] = []
+        base_tree = None
+        remote: dict[str, str] = {}
+        if ref.status_code != 404:
+            tip = ref.json()["object"]["sha"]
+            parents = [tip]
+            current = self.request("GET", f"/repos/{self.repo}/git/commits/{tip}").json()
+            base_tree = current["tree"]["sha"]
+            remote = self._tree_blobs(base_tree)
+        elif base:
+            parents = [base]
+            current = self.request("GET", f"/repos/{self.repo}/git/commits/{base}").json()
+            base_tree = current["tree"]["sha"]
+            remote = self._tree_blobs(base_tree)
+        entries = self._changed_entries(files, remote, prefix)
+        if ref.status_code != 404 and not entries:
+            return parents[0]
+        body: dict = {"tree": entries}
+        if base_tree:
+            body["base_tree"] = base_tree
+        tree_sha = self.request("POST", f"/repos/{self.repo}/git/trees", body).json()["sha"]
         commit = self.request(
             "POST",
             f"/repos/{self.repo}/git/commits",
             {"message": message, "tree": tree_sha, "parents": parents},
         ).json()["sha"]
-        if parents:
+        if ref.status_code != 404:
             self.request(
                 "PATCH",
                 f"/repos/{self.repo}/git/refs/heads/{branch}",
@@ -265,51 +362,28 @@ class GitHub:
             )
         return commit
 
-    def commit_site(self, files: dict[str, bytes], live_sha: str) -> str:
-        """Commit main's tree plus web/live blobs on pages-src.
+    def commit_files(self, branch: str, files: dict[str, bytes], message: str) -> str:
+        return self._commit_tree(branch, message, files)
 
-        The blob SHAs are the live-data blobs already stored for this snapshot.
-        The new commit is a fast-forward of pages-src, or a child of main when
-        that branch does not exist yet. No workflow dispatch.
+    def commit_site(self, files: dict[str, bytes], live_sha: str) -> str:
+        """Fast-forward pages-src, or start it from main.
+
+        The tree is the branch tip (main, the first time) plus web/live blobs
+        that differ. Unchanged coin files stay inherited and are not uploaded.
+        No workflow dispatch.
         """
-        main_sha = self.branch_tip(SOURCE_BRANCH)
-        if not main_sha:
-            raise PublishError("main branch was not found")
-        main_commit = self.request("GET", f"/repos/{self.repo}/git/commits/{main_sha}").json()
-        entries = [
-            {
-                "path": f"web/live/{path}",
-                "mode": "100644",
-                "type": "blob",
-                "sha": git_blob_sha(files[path]),
-            }
-            for path in sorted(files)
-        ]
-        tree_sha = self.request(
-            "POST",
-            f"/repos/{self.repo}/git/trees",
-            {"base_tree": main_commit["tree"]["sha"], "tree": entries},
-        ).json()["sha"]
-        tip = self.branch_tip(PAGES_BRANCH)
-        parents = [tip or main_sha]
-        commit = self.request(
-            "POST",
-            f"/repos/{self.repo}/git/commits",
-            {"message": f"{PAGES_MESSAGE} {live_sha}", "tree": tree_sha, "parents": parents},
-        ).json()["sha"]
-        if tip:
-            self.request(
-                "PATCH",
-                f"/repos/{self.repo}/git/refs/heads/{PAGES_BRANCH}",
-                {"sha": commit, "force": False},
-            )
-        else:
-            self.request(
-                "POST",
-                f"/repos/{self.repo}/git/refs",
-                {"ref": f"refs/heads/{PAGES_BRANCH}", "sha": commit},
-            )
-        return commit
+        base = None
+        if self.branch_tip(PAGES_BRANCH) is None:
+            base = self.branch_tip(SOURCE_BRANCH)
+            if not base:
+                raise PublishError("main branch was not found")
+        return self._commit_tree(
+            PAGES_BRANCH,
+            f"{PAGES_MESSAGE} {live_sha}",
+            files,
+            prefix="web/live/",
+            base=base,
+        )
 
 
 def publish(root: Path, github: GitHub) -> str:
