@@ -37,8 +37,12 @@ _ATTEMPTS = 4
 _BACKOFF_S = (2, 4, 8)
 # Four attempts plus the backoff stays under the 120s launcher limit.
 _ATTEMPT_TIMEOUT_S = 20.0
-# Blob uploads are the slow part of a catch-up. Eight at a time keeps ~1000 files under the launcher limit.
-_BLOB_WORKERS = 8
+# More than this many changed files is a catch-up: one blob POST per file hits GitHub's content rate limit.
+_BLOB_LIMIT = 40
+_BLOB_WORKERS = 4
+# ~150 inline files per tree POST. 1068 changed files is 8 requests, then one commit and a ref update.
+_TREE_CHUNK = 150
+_RATE_LIMIT_S = 600
 _CORE = ("state.json", "chart.json", "activity.json")
 _SECRET_ENV = (
     "DATA_PATH",
@@ -60,6 +64,12 @@ class GitHubError(Exception):
         self.status = status
         self.message = message
         super().__init__(f"{status} {message}".strip())
+
+
+class RateLimitError(GitHubError):
+    def __init__(self, status: int, message: str, wait_s: int) -> None:
+        self.wait_s = wait_s
+        super().__init__(status, message)
 
 
 def redact(text: str, token: str = "") -> str:
@@ -108,6 +118,25 @@ def git_blob_sha(content: bytes) -> str:
 
 def dispatch_marker(root: Path) -> Path:
     return root.parent / f"{root.name}.dispatch-pending"
+
+
+def backoff_marker(root: Path) -> Path:
+    return Path(root).parent / "publish-backoff-until"
+
+
+def backoff_remaining(root: Path) -> int:
+    path = backoff_marker(root)
+    try:
+        until = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+    return max(0, until - int(time.time()))
+
+
+def arm_backoff(root: Path, wait_s: int) -> None:
+    path = backoff_marker(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(int(time.time()) + max(1, int(wait_s))), encoding="utf-8")
 
 
 def _inside(root: Path, path: Path) -> bool:
@@ -213,6 +242,28 @@ class GitHub:
             message = ""
         return self._redact(message)
 
+    def _rate_limit_wait(self, response: httpx.Response) -> int | None:
+        if response.status_code not in (403, 429):
+            return None
+        message = self._error_message(response).lower()
+        retry_after = response.headers.get("Retry-After")
+        reset = response.headers.get("x-ratelimit-reset")
+        if "rate limit" not in message and not retry_after and not reset:
+            return None
+        if retry_after:
+            try:
+                return max(1, int(float(retry_after)))
+            except ValueError:
+                pass
+        if reset:
+            try:
+                delta = int(float(reset) - time.time())
+                if delta > 0:
+                    return delta
+            except ValueError:
+                pass
+        return _RATE_LIMIT_S
+
     def _ref_already(self, path: str, sha: str) -> bool:
         ref = self.request("GET", path, allow=(404,))
         if ref.status_code != 200:
@@ -244,6 +295,9 @@ class GitHub:
                     raise GitHubError(0, self._redact(exc.__class__.__name__)) from None
                 self._sleep(_BACKOFF_S[attempt])
                 continue
+            wait_s = self._rate_limit_wait(response)
+            if wait_s is not None and response.status_code not in allow:
+                raise RateLimitError(response.status_code, self._error_message(response), wait_s)
             if response.status_code in _RETRY_STATUSES and response.status_code not in allow:
                 if attempt + 1 >= _ATTEMPTS:
                     raise GitHubError(response.status_code, self._error_message(response))
@@ -312,13 +366,19 @@ class GitHub:
                 files[item["path"]] = item["sha"]
         return files, bool(tree.get("truncated"))
 
-    def _changed_entries(self, files: dict[str, bytes], remote: dict[str, str], prefix: str = "") -> list[dict]:
+    def _pending(self, files: dict[str, bytes], remote: dict[str, str], prefix: str = "") -> list[tuple[str, bytes]]:
         pending = []
         for path in sorted(files):
             full = f"{prefix}{path}"
             if remote.get(full) == git_blob_sha(files[path]):
                 continue
             pending.append((full, files[path]))
+        return pending
+
+    def _changed_entries(self, files: dict[str, bytes], remote: dict[str, str], prefix: str = "") -> list[dict]:
+        return self._blob_entries(self._pending(files, remote, prefix))
+
+    def _blob_entries(self, pending: list[tuple[str, bytes]]) -> list[dict]:
         if not pending:
             return []
 
@@ -334,41 +394,47 @@ class GitHub:
         with ThreadPoolExecutor(max_workers=_BLOB_WORKERS) as pool:
             return list(pool.map(upload, pending))
 
-    def _commit_tree(self, branch: str, message: str, files: dict[str, bytes], prefix: str = "", base: str | None = None) -> str:
-        """Commit `files` onto `branch`, inheriting unchanged paths from its tip.
-
-        `base` is the commit to start from when `branch` does not exist yet.
-        Changed files are uploaded one blob at a time and referenced by sha.
-        Paths missing locally are left in the tree.
-        """
-        ref = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}", allow=(404,))
-        parents: list[str] = []
-        base_tree = None
-        remote: dict[str, str] = {}
-        if ref.status_code != 404:
-            tip = ref.json()["object"]["sha"]
-            parents = [tip]
-            current = self.request("GET", f"/repos/{self.repo}/git/commits/{tip}").json()
-            base_tree = current["tree"]["sha"]
-            remote = self._tree_blobs(base_tree)
-        elif base:
-            parents = [base]
-            current = self.request("GET", f"/repos/{self.repo}/git/commits/{base}").json()
-            base_tree = current["tree"]["sha"]
-            remote = self._tree_blobs(base_tree)
-        entries = self._changed_entries(files, remote, prefix)
-        if ref.status_code != 404 and not entries:
-            return parents[0]
+    def _post_tree(self, entries: list[dict], base_tree: str | None) -> str:
         body: dict = {"tree": entries}
         if base_tree:
             body["base_tree"] = base_tree
-        tree_sha = self.request("POST", f"/repos/{self.repo}/git/trees", body).json()["sha"]
+        return self.request("POST", f"/repos/{self.repo}/git/trees", body).json()["sha"]
+
+    def _inline_tree(self, pending: list[tuple[str, bytes]], base_tree: str | None) -> str:
+        tree_sha = base_tree
+        for start in range(0, len(pending), _TREE_CHUNK):
+            entries = [
+                {
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "content": content.decode("utf-8"),
+                }
+                for path, content in pending[start : start + _TREE_CHUNK]
+            ]
+            tree_sha = self._post_tree(entries, tree_sha)
+        return tree_sha or ""
+
+    def _tip_context(self, branch: str, base: str | None) -> tuple[int, list[str], str | None, dict[str, str]]:
+        ref = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}", allow=(404,))
+        if ref.status_code != 404:
+            tip = ref.json()["object"]["sha"]
+            current = self.request("GET", f"/repos/{self.repo}/git/commits/{tip}").json()
+            base_tree = current["tree"]["sha"]
+            return ref.status_code, [tip], base_tree, self._tree_blobs(base_tree)
+        if not base:
+            return ref.status_code, [], None, {}
+        current = self.request("GET", f"/repos/{self.repo}/git/commits/{base}").json()
+        base_tree = current["tree"]["sha"]
+        return ref.status_code, [base], base_tree, self._tree_blobs(base_tree)
+
+    def _finish_commit(self, branch: str, message: str, tree_sha: str, parents: list[str], existed: bool) -> str:
         commit = self.request(
             "POST",
             f"/repos/{self.repo}/git/commits",
             {"message": message, "tree": tree_sha, "parents": parents},
         ).json()["sha"]
-        if ref.status_code != 404:
+        if existed:
             self.request(
                 "PATCH",
                 f"/repos/{self.repo}/git/refs/heads/{branch}",
@@ -382,31 +448,74 @@ class GitHub:
             )
         return commit
 
+    def _commit_tree(self, branch: str, message: str, files: dict[str, bytes], prefix: str = "", base: str | None = None, catch_up: bool = False) -> str:
+        """Commit `files` onto `branch`, inheriting unchanged paths from its tip.
+
+        A catch-up (more than 40 changed files) sends inline content in chunks
+        of 150 and chains base_tree. Smaller updates upload blobs and reference
+        them by sha. Paths missing locally are left in the tree.
+        """
+        status, parents, base_tree, remote = self._tip_context(branch, base)
+        pending = self._pending(files, remote, prefix)
+        existed = status != 404
+        if existed and not pending:
+            return parents[0]
+        if catch_up and len(pending) > _BLOB_LIMIT:
+            tree_sha = self._inline_tree(pending, base_tree)
+        else:
+            tree_sha = self._post_tree(self._blob_entries(pending), base_tree)
+        return self._finish_commit(branch, message, tree_sha, parents, existed)
+
     def commit_files(self, branch: str, files: dict[str, bytes], message: str) -> str:
-        return self._commit_tree(branch, message, files)
+        return self._commit_tree(branch, message, files, catch_up=True)
 
     def commit_site(self, files: dict[str, bytes], live_sha: str) -> str:
         """Fast-forward pages-src, or start it from main.
 
-        The tree is the branch tip (main, the first time) plus web/live blobs
-        that differ. Unchanged coin files stay inherited and are not uploaded.
-        No workflow dispatch.
+        A catch-up reuses blob shas already stored on live-data, in one tree
+        POST. Smaller updates use the blob path. No workflow dispatch.
         """
         base = None
         if self.branch_tip(PAGES_BRANCH) is None:
             base = self.branch_tip(SOURCE_BRANCH)
             if not base:
                 raise PublishError("main branch was not found")
-        return self._commit_tree(
-            PAGES_BRANCH,
-            f"{PAGES_MESSAGE} {live_sha}",
-            files,
-            prefix="web/live/",
-            base=base,
-        )
+        status, parents, base_tree, remote = self._tip_context(PAGES_BRANCH, base)
+        pending = self._pending(files, remote, "web/live/")
+        existed = status != 404
+        if existed and not pending:
+            return parents[0]
+        if len(pending) > _BLOB_LIMIT:
+            live, _truncated = self.branch_state(LIVE_BRANCH)
+            live = live or {}
+            entries = [
+                {
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": live.get(path.removeprefix("web/live/")) or git_blob_sha(content),
+                }
+                for path, content in pending
+            ]
+            tree_sha = self._post_tree(entries, base_tree)
+        else:
+            tree_sha = self._post_tree(self._blob_entries(pending), base_tree)
+        return self._finish_commit(PAGES_BRANCH, f"{PAGES_MESSAGE} {live_sha}", tree_sha, parents, existed)
 
 
 def publish(root: Path, github: GitHub) -> str:
+    remaining = backoff_remaining(root)
+    if remaining > 0:
+        return f"skipped, GitHub rate limit backoff for {remaining}s"
+    backoff_marker(root).unlink(missing_ok=True)
+    try:
+        return _publish(root, github)
+    except RateLimitError as exc:
+        arm_backoff(root, exc.wait_s)
+        raise
+
+
+def _publish(root: Path, github: GitHub) -> str:
     files = load_live_files(root)
     if not files:
         raise PublishError("no live files to publish")
@@ -444,6 +553,15 @@ def main() -> None:
     try:
         with GitHub(token, repo) as github:
             result = publish(root, github)
+    except RateLimitError as exc:
+        print(
+            redact(
+                f"GitHub rate limit ({exc.status}). Pausing publishes for {exc.wait_s}s. {exc.message}",
+                token,
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
     except GitHubError as exc:
         print(redact(f"publish failed ({exc.status}) {exc.message}", token), file=sys.stderr)
         raise SystemExit(1) from None

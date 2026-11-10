@@ -2,6 +2,7 @@ import hashlib
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -15,10 +16,14 @@ from db import Database
 from livecrypto import decrypt_envelope, encrypt_envelope, envelope_bytes, is_live_path
 from publish_live import (
     COMMIT_MESSAGE,
+    _BLOB_LIMIT,
     _BLOB_WORKERS,
+    _TREE_CHUNK,
     GitHub,
     GitHubError,
     PublishError,
+    RateLimitError,
+    backoff_marker,
     git_blob_sha,
     load_live_files,
     owner_repo,
@@ -239,6 +244,8 @@ class _Api:
         self.bodies = []
         self.tree_posts = []
         self.blob_posts = []
+        self.created_trees = []
+        self.rate_limit = None
         self._lock = threading.Lock()
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -269,6 +276,18 @@ class _Api:
         if request.method == "GET" and rest.startswith("/git/trees/"):
             sha = rest.rsplit("/", 1)[-1]
             return httpx.Response(200, json={"sha": sha, "tree": self.trees[sha], "truncated": False})
+        if self.rate_limit and request.method == "POST" and rest in ("/git/blobs", "/git/trees"):
+            headers = {}
+            if self.rate_limit == "retry-after":
+                headers["Retry-After"] = "120"
+            elif self.rate_limit == "reset":
+                headers["x-ratelimit-reset"] = str(int(time.time()) + 180)
+            self.rate_hits = getattr(self, "rate_hits", 0) + 1
+            return httpx.Response(
+                403,
+                json={"message": f"You have exceeded a secondary rate limit {FIXTURE_TOKEN}"},
+                headers=headers,
+            )
         if request.method == "POST" and rest == "/git/blobs":
             assert body.get("encoding") == "utf-8"
             content = body["content"].encode("utf-8")
@@ -282,16 +301,20 @@ class _Api:
                 for item in self.trees[body["base_tree"]]:
                     merged[item["path"]] = dict(item)
             for entry in body["tree"]:
-                assert "content" not in entry
+                if "content" in entry:
+                    blob_sha = git_blob_sha(entry["content"].encode("utf-8"))
+                else:
+                    blob_sha = entry["sha"]
                 merged[entry["path"]] = {
                     "path": entry["path"],
                     "mode": "100644",
                     "type": "blob",
-                    "sha": entry["sha"],
+                    "sha": blob_sha,
                 }
             tree_sha = f"tree{len(self.trees) + 1}"
             self.trees[tree_sha] = [merged[path] for path in sorted(merged)]
-            return httpx.Response(201, json={"sha": tree_sha})
+            self.created_trees.append(tree_sha)
+            return httpx.Response(201, json={"sha": tree_sha, "tree": self.trees[tree_sha]})
         if request.method == "POST" and rest == "/git/commits":
             sha = f"commit{len(self.commits) + 1}"
             self.commits[sha] = {"tree": body["tree"], "parents": body["parents"], "message": body["message"]}
@@ -397,6 +420,8 @@ def test_publish_retries_pages_src_without_reprinting_the_token(tmp_path, monkey
             publish(root, github)
         assert FIXTURE_TOKEN not in str(exc.value)
         assert "[redacted]" in str(exc.value)
+        assert not isinstance(exc.value, RateLimitError)
+        assert not backoff_marker(root).exists()
         assert (tmp_path / "live.dispatch-pending").is_file()
         live_commits = [sha for sha in api.commits if sha != "mainsha" and api.commits[sha]["parents"] == []]
         api.fail_pages = False
@@ -691,5 +716,137 @@ def test_changed_blobs_upload_on_a_bounded_pool():
         assert [item["path"] for item in entries] == sorted(path for path in files if path != "coin/M00.json")
         assert inflight["max"] == _BLOB_WORKERS
         assert {item["sha"] for item in entries} == {git_blob_sha(files[item["path"]]) for item in entries}
+    finally:
+        github.close()
+
+
+def _snapshot(root: Path, count: int, salt: str = "") -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "coin").mkdir(exist_ok=True)
+
+    def envelope(token: str) -> bytes:
+        return json.dumps(
+            {"v": 1, "alg": "AES-256-GCM", "n": "AAAAAAAAAAAA", "c": f"{salt}{token}"},
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    for name in ("state.json", "chart.json", "activity.json"):
+        (root / name).write_bytes(envelope(name))
+    for index in range(count - 3):
+        (root / "coin" / f"C{index:04d}.json").write_bytes(envelope(f"c{index}"))
+
+
+def test_small_change_uses_blob_uploads(tmp_path):
+    root = tmp_path / "live"
+    _snapshot(root, 10)
+    api = _Api()
+    github = _github(api)
+    try:
+        assert _BLOB_WORKERS == 4
+        assert _BLOB_LIMIT == 40
+        assert publish(root, github) == "updated"
+        assert len(api.blob_posts) == 10
+        assert len(api.tree_posts) == 2
+        assert all("content" not in entry for body in api.tree_posts for entry in body["tree"])
+    finally:
+        github.close()
+
+
+def test_catch_up_of_1068_files_chunks_trees_and_posts_no_blobs(tmp_path):
+    root = tmp_path / "live"
+    _snapshot(root, 1068)
+    api = _Api()
+    github = _github(api)
+    try:
+        assert publish(root, github) == "updated"
+        assert api.blob_posts == []
+        content = [body for body in api.tree_posts if any("content" in entry for entry in body["tree"])]
+        sha_only = [body for body in api.tree_posts if body not in content]
+        assert len(content) <= 8
+        assert len(content) == 8
+        assert sum(len(body["tree"]) for body in content) == 1068
+        assert all(len(body["tree"]) <= _TREE_CHUNK for body in content)
+        assert "base_tree" not in content[0]
+        for index in range(1, len(content)):
+            assert content[index]["base_tree"] == api.created_trees[index - 1]
+        assert len(sha_only) == 1
+        assert sha_only[0]["base_tree"] == "maintree"
+        assert len(sha_only[0]["tree"]) == 1068
+        assert all("content" not in entry and entry.get("sha") for entry in sha_only[0]["tree"])
+        assert "publish-backoff-until" not in load_live_files(root)
+        live_tree = api.commits[api.ref]["tree"]
+        pages_tree = api.commits[api.pages_ref]["tree"]
+        api.tree_posts.clear()
+        api.blob_posts.clear()
+        api.created_trees.clear()
+        _snapshot(root, 1068, salt="b")
+        assert publish(root, github) == "updated"
+        assert api.blob_posts == []
+        again = [body for body in api.tree_posts if any("content" in entry for entry in body["tree"])]
+        sha_again = [body for body in api.tree_posts if body not in again]
+        assert len(again) == 8
+        assert again[0]["base_tree"] == live_tree
+        for index in range(1, len(again)):
+            assert again[index]["base_tree"] == api.created_trees[index - 1]
+        assert len(sha_again) == 1
+        assert sha_again[0]["base_tree"] == pages_tree
+        assert all("content" not in entry for entry in sha_again[0]["tree"])
+    finally:
+        github.close()
+
+
+def test_rate_limit_writes_backoff_and_later_runs_skip(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GH_TOKEN", FIXTURE_TOKEN)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "example/desk")
+    monkeypatch.setenv("LIVE_ROOT", str(tmp_path / "live"))
+    root = tmp_path / "live"
+    _envelopes(root)
+    api = _Api()
+    api.rate_limit = "retry-after"
+    monkeypatch.setattr("publish_live.GitHub", lambda token, repo, client=None, sleep=None: _github(api))
+    from publish_live import main
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "rate limit" in captured.err.lower()
+    assert "120" in captured.err
+    assert FIXTURE_TOKEN not in captured.err
+    assert FIXTURE_TOKEN not in captured.out
+    marker = backoff_marker(root)
+    assert marker == tmp_path / "publish-backoff-until"
+    assert not marker.is_relative_to(root)
+    until = int(marker.read_text(encoding="utf-8"))
+    assert 100 < until - time.time() < 150
+    assert FIXTURE_TOKEN not in marker.read_text(encoding="utf-8")
+    hits = api.rate_hits
+    assert 1 <= hits <= _BLOB_WORKERS
+    github = _github(api)
+    try:
+        skipped = publish(root, github)
+        assert skipped.startswith("skipped, GitHub rate limit backoff")
+        assert api.rate_hits == hits
+        assert "publish-backoff-until" not in load_live_files(root)
+    finally:
+        github.close()
+
+
+def test_rate_limit_without_retry_after_waits_ten_minutes(tmp_path):
+    root = tmp_path / "live"
+    _envelopes(root)
+    api = _Api()
+    api.rate_limit = "message"
+    github = _github(api)
+    try:
+        with pytest.raises(RateLimitError) as exc:
+            publish(root, github)
+        assert exc.value.wait_s == 600
+        hits = api.rate_hits
+        assert 1 <= hits <= _BLOB_WORKERS
+        until = int(backoff_marker(root).read_text(encoding="utf-8"))
+        assert 580 < until - time.time() < 620
+        assert publish(root, github).startswith("skipped")
+        assert api.rate_hits == hits
     finally:
         github.close()
