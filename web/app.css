@@ -30,6 +30,10 @@ a { color: var(--cyan); text-decoration: none; }
   padding-bottom: calc(72px + var(--safe-bot));
 }
 
+.desks { display: flex; gap: 8px; padding: 12px 16px 0; }
+.desks button { border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; color: var(--muted); font-size: 13px; }
+.desks button.on { color: var(--text); border-color: var(--text); }
+
 .error {
   position: sticky;
   top: 0;

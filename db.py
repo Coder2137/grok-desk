@@ -155,9 +155,12 @@ class Database:
     def close(self) -> None:
         self.conn.close()
 
-    def ensure_defaults(self) -> None:
+    def ensure_defaults(self, overrides: dict | None = None) -> None:
         now = iso(utc_now())
+        chosen = overrides or {}
         for key, value in defaults().items():
+            if key in chosen:
+                value = chosen[key]
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (key, _store(value), now),

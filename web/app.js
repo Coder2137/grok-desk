@@ -15,8 +15,16 @@
     offline: false,
     retry: 15,
     timer: null,
-    seen: Number(localStorage.getItem("deskSeen") || 0),
+    seen: Number(localStorage.getItem(localStorage.getItem("deskSlot") === "desk2" ? "deskSeen2" : "deskSeen") || 0),
   };
+
+  function deskSlot() {
+    return localStorage.getItem("deskSlot") === "desk2" ? "desk2" : "desk1";
+  }
+
+  function deskPrefix() {
+    return deskSlot() === "desk2" ? "desk2/" : "";
+  }
 
   function capturePath() {
     const match = location.hash.match(/(?:^#|[&#])d=([^&]+)/);
@@ -29,7 +37,7 @@
   async function pull(file) {
     const dataPath = capturePath();
     if (!dataPath) throw new Error("missing");
-    return globalThis.DeskLive.loadDeskFile(file, { dataPath: dataPath, pageUrl: location.href });
+    return globalThis.DeskLive.loadDeskFile(deskPrefix() + file, { dataPath: dataPath, pageUrl: location.href });
   }
 
   function esc(value) {
@@ -139,7 +147,7 @@
     const rows = (state.activity && state.activity.rows) || [];
     const max = rows.reduce((best, row) => Math.max(best, Number(row.id) || 0), state.seen);
     state.seen = max;
-    localStorage.setItem("deskSeen", String(max));
+    localStorage.setItem(deskSlot() === "desk2" ? "deskSeen2" : "deskSeen", String(max));
   }
 
   function home() {
@@ -148,6 +156,10 @@
     const change = Number(data.dayChangePct || 0);
     const hits = filteredCoins();
     return `
+      <div class="desks">
+        <button type="button" data-desk="desk1" class="${deskSlot() === "desk1" ? "on" : ""}">Desk 1</button>
+        <button type="button" data-desk="desk2" class="${deskSlot() === "desk2" ? "on" : ""}">Desk 2</button>
+      </div>
       <div class="nav">
         <button class="avatar" id="go-account" aria-label="Account">•</button>
         <button class="brand" id="go-agents">Grok Bot ›</button>
@@ -382,6 +394,17 @@
         }
       });
     }
+    document.querySelectorAll("[data-desk]").forEach((button) => {
+      button.addEventListener("click", () => {
+        localStorage.setItem("deskSlot", button.dataset.desk === "desk2" ? "desk2" : "desk1");
+        state.seen = Number(localStorage.getItem(deskSlot() === "desk2" ? "deskSeen2" : "deskSeen") || 0);
+        state.data = null;
+        state.chart = null;
+        state.activity = null;
+        state.coin = null;
+        poll();
+      });
+    });
     document.querySelectorAll("[data-range]").forEach((button) => {
       button.addEventListener("click", () => {
         state.range = button.dataset.range;
