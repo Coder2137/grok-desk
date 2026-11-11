@@ -29,9 +29,9 @@ def is_live_path(relative: str) -> bool:
         return True
     if len(parts) == 2 and parts[0] == "coin" and _coin_file(parts[1]):
         return True
-    if len(parts) == 2 and parts[0] == "desk2" and parts[1] in _CORE:
+    if len(parts) == 2 and parts[0] in ("desk2", "desk3") and parts[1] in _CORE:
         return True
-    return len(parts) == 3 and parts[0] == "desk2" and parts[1] == "coin" and _coin_file(parts[2])
+    return len(parts) == 3 and parts[0] in ("desk2", "desk3") and parts[1] == "coin" and _coin_file(parts[2])
 
 
 def _coin_file(name: str) -> bool:

@@ -197,6 +197,7 @@ def load_live_files(root: Path) -> dict[str, bytes]:
         return {}
     candidates = _live_candidates(root, "")
     candidates.extend(_live_candidates(root, "desk2"))
+    candidates.extend(_live_candidates(root, "desk3"))
     found: dict[str, bytes] = {}
     for path in candidates:
         if not path.is_file() or not _inside(root, path):

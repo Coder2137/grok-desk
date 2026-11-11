@@ -33,13 +33,13 @@ Set these in the environment or in a gitignored `.env`. Do not commit the values
 
 ## Desk 2
 
-A second paper desk can run beside this one. It does not change desk 1's database, $40,000 liquidity floor, or Telegram. Start it with `DESK_INSTANCE=desk2` or `python main.py --instance desk2`. The Windows launchers are `run-desk2.ps1` and `GrokDesk2.cmd`.
+Two more paper desks can run beside this one. Internal ids stay `desk1`, `desk2`, and `desk3`. The phone shows them as Desk 40k, Desk 10k, and Desk 20k. Desk 1's database, $40,000 liquidity floor, and Telegram are unchanged.
 
-Desk 2 uses `var/desk2.db`, plaintext under `var/desk2/json`, and a $200 paper stack. Its scanner liquidity floor is $10,000. Every other filter matches desk 1. `run-desk2.ps1` loads `%USERPROFILE%\.desk-secrets\env` the same way as desk 1 and never prints those values. `FORCE_LIVE` is refused. `DESK_INSTANCE` stays `desk2` and `DESK_TELEGRAM` stays `0`, even if the secrets file says otherwise, so desk 2 does not send Telegram. Logs go to `logs/desk2/`. `GrokDesk2.cmd` can sit in the Startup folder: it runs `%USERPROFILE%\grok-desk\run-desk2.ps1`, or `%DESK_HOME%\run-desk2.ps1` when `DESK_HOME` is set.
+Desk 2 (`DESK_INSTANCE=desk2`, `run-desk2.ps1`, `GrokDesk2.cmd`) uses `var/desk2.db`, plaintext under `var/desk2/json`, logs in `logs/desk2/`, and a $10,000 liquidity floor. Desk 3 (`DESK_INSTANCE=desk3`, `run-desk3.ps1`, `GrokDesk3.cmd`) uses `var/desk3.db`, `var/desk3/json`, `logs/desk3/`, and a $20,000 floor. Both start at a $200 paper stack. Every other filter matches desk 1. Their launchers load `%USERPROFILE%\.desk-secrets\env` and never print those values. `FORCE_LIVE` is refused. `DESK_TELEGRAM` stays `0`. A Startup copy of `GrokDesk2.cmd` or `GrokDesk3.cmd` runs `%USERPROFILE%\grok-desk\run-desk2.ps1` or `run-desk3.ps1`, or the matching script under `%DESK_HOME%` when that variable is set.
 
-Only desk 1 opens the PumpPortal websocket. It appends each migration frame to `var/feed/migrations.jsonl`. Desk 2 reads that file. If desk 2 is stopped, desk 1 keeps appending and does not wait on it.
+Only desk 1 opens the PumpPortal websocket. It appends each migration frame to `var/feed/migrations.jsonl`. Desk 2 and desk 3 read that file, with offsets `var/desk2/feed.offset` and `var/desk3/feed.offset`. If either is stopped, desk 1 keeps appending and does not wait.
 
-Encrypted files for desk 2 are `var/live/desk2/state.json`, `chart.json`, `activity.json`, and `coin/<mint>.json`. The same publisher sends them with the desk 1 files. The phone page has Desk 1 and Desk 2 switches. The decrypt key is still the stored path. The extra data for a desk 2 file is its path, such as `desk2/state.json`.
+Encrypted files are `var/live/desk2/...` and `var/live/desk3/...` (`state.json`, `chart.json`, `activity.json`, and `coin/<mint>.json`). The same publisher sends them with the desk 1 files. The phone switch is ordered Desk 10k, Desk 20k, Desk 40k. The decrypt key is still the stored path. The extra data for a side desk file is its path, such as `desk3/state.json`.
 
 A PumpPortal migration frame uses `mint`, `signature`, and `pool`. On the captured frame `pool` was the venue label `pump-amm`, not an account address, and `creator` was absent so it stays null. The account address used later is the DexScreener pair address when that pair is known. The subscribe reply `Subscribed to 'migration' events.` is not a migration frame. `var/migration_keys.json` on the operator machine can override those names. That file stays out of git.
 
