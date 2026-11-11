@@ -3,8 +3,11 @@
 Run this on the operator machine. It reads GH_TOKEN or GITHUB_TOKEN from the
 environment and does not print that token or DATA_PATH.
 
-live-data stays a ciphertext-only branch. pages-src starts from main, then each
-later commit keeps that tree and replaces only the web/live blobs that changed.
+live-data stays a ciphertext-only branch. pages-src is a fast-forward chain.
+When main moves, the new tree is main's current tree plus the current
+web/live ciphertext, so site files on main reach Pages. A main tip that has
+not moved keeps the previous pages-src tree and replaces only changed
+web/live blobs.
 Pushing pages-src runs Pages.
 actions/deploy-pages uses that commit SHA as pages_build_version, so each
 snapshot is a new Pages version. Dispatching the workflow on main is not used:
@@ -122,6 +125,23 @@ def dispatch_marker(root: Path) -> Path:
 
 def backoff_marker(root: Path) -> Path:
     return Path(root).parent / "publish-backoff-until"
+
+
+def main_tip_cache(root: Path) -> Path:
+    return Path(root) / ".main-tip"
+
+
+def cached_main_tip(root: Path) -> str:
+    try:
+        return main_tip_cache(root).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def store_main_tip(root: Path, sha: str) -> None:
+    path = main_tip_cache(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sha + "\n", encoding="utf-8")
 
 
 def backoff_remaining(root: Path) -> int:
@@ -476,18 +496,40 @@ class GitHub:
     def commit_files(self, branch: str, files: dict[str, bytes], message: str) -> str:
         return self._commit_tree(branch, message, files, catch_up=True)
 
-    def commit_site(self, files: dict[str, bytes], live_sha: str) -> str:
-        """Fast-forward pages-src, or start it from main.
+    def _live_sha_entries(self, files: dict[str, bytes]) -> list[dict]:
+        """Current ciphertext blob ids under web/live. These replace any copy on main."""
+        return [
+            {
+                "path": f"web/live/{path}",
+                "mode": "100644",
+                "type": "blob",
+                "sha": git_blob_sha(files[path]),
+            }
+            for path in sorted(files)
+        ]
 
-        A catch-up reuses blob shas already stored on live-data, in one tree
-        POST. Smaller updates use the blob path. No workflow dispatch.
+    def commit_site(self, files: dict[str, bytes], live_sha: str, main_tip: str, rebuild_from_main: bool) -> str:
+        """Fast-forward pages-src.
+
+        When main's tip changed, the tree starts from that commit and every
+        current live file is written over web/live, including desk2/. The
+        parent is the previous pages-src tip, or main the first time. When
+        main has not moved, only changed web/live blobs are sent. No dispatch.
         """
-        base = None
-        if self.branch_tip(PAGES_BRANCH) is None:
-            base = self.branch_tip(SOURCE_BRANCH)
-            if not base:
+        pages_tip = self.branch_tip(PAGES_BRANCH)
+        if rebuild_from_main or not pages_tip:
+            if not main_tip:
                 raise PublishError("main branch was not found")
-        status, parents, base_tree, remote = self._tip_context(PAGES_BRANCH, base)
+            main_commit = self.request("GET", f"/repos/{self.repo}/git/commits/{main_tip}").json()
+            tree_sha = self._post_tree(self._live_sha_entries(files), main_commit["tree"]["sha"])
+            return self._finish_commit(
+                PAGES_BRANCH,
+                f"{PAGES_MESSAGE} {live_sha}",
+                tree_sha,
+                [pages_tip or main_tip],
+                pages_tip is not None,
+            )
+        status, parents, base_tree, remote = self._tip_context(PAGES_BRANCH, None)
         pending = self._pending(files, remote, "web/live/")
         existed = status != 404
         if existed and not pending:
@@ -531,8 +573,12 @@ def _publish(root: Path, github: GitHub) -> str:
     _reject_secret_material(files)
     remote, truncated = github.branch_state(LIVE_BRANCH)
     changed = not same_files(files, remote, truncated)
+    main_tip = github.branch_tip(SOURCE_BRANCH)
+    if not main_tip:
+        raise PublishError("main branch was not found")
+    main_moved = cached_main_tip(root) != main_tip
     marker = dispatch_marker(root)
-    if not changed and not marker.is_file():
+    if not changed and not main_moved and not marker.is_file():
         return "unchanged"
     if changed:
         live_sha = github.commit_files(LIVE_BRANCH, files, COMMIT_MESSAGE)
@@ -542,8 +588,9 @@ def _publish(root: Path, github: GitHub) -> str:
             raise PublishError("live branch was not found")
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("1", encoding="utf-8")
-    github.commit_site(files, live_sha)
+    github.commit_site(files, live_sha, main_tip, main_moved)
     marker.unlink(missing_ok=True)
+    store_main_tip(root, main_tip)
     return "updated" if changed else "published"
 
 

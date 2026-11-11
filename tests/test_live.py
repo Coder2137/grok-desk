@@ -236,6 +236,8 @@ class _Api:
     def __init__(self) -> None:
         self.ref = None
         self.pages_ref = None
+        self.main_sha = "mainsha"
+        self.commit_gets = []
         self.commits = {
             "mainsha": {"tree": "maintree", "parents": [], "message": "main"},
         }
@@ -260,7 +262,7 @@ class _Api:
         rest = path[len(prefix) :]
         body = json.loads(request.content) if request.content else {}
         if request.method == "GET" and rest == "/git/ref/heads/main":
-            return httpx.Response(200, json={"object": {"sha": "mainsha", "type": "commit"}})
+            return httpx.Response(200, json={"object": {"sha": self.main_sha, "type": "commit"}})
         if request.method == "GET" and rest == "/git/ref/heads/live-data":
             if self.ref is None:
                 return httpx.Response(404, json={"message": "Not Found"})
@@ -271,6 +273,7 @@ class _Api:
             return httpx.Response(200, json={"object": {"sha": self.pages_ref, "type": "commit"}})
         if request.method == "GET" and rest.startswith("/git/commits/"):
             sha = rest.rsplit("/", 1)[-1]
+            self.commit_gets.append(sha)
             commit = self.commits[sha]
             return httpx.Response(200, json={"sha": sha, "tree": {"sha": commit["tree"]}, "message": commit["message"]})
         if request.method == "GET" and rest.startswith("/git/trees/"):
@@ -848,5 +851,60 @@ def test_rate_limit_without_retry_after_waits_ten_minutes(tmp_path):
         assert 580 < until - time.time() < 620
         assert publish(root, github).startswith("skipped")
         assert api.rate_hits == hits
+    finally:
+        github.close()
+
+
+def test_main_tip_change_reaches_pages_src_without_replacing_ciphertext(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_PATH", FIXTURE_DATA_PATH)
+    root = tmp_path / "live"
+    _envelopes(root)
+    desk2 = root / "desk2" / "state.json"
+    desk2.parent.mkdir()
+    desk2.write_bytes(
+        envelope_bytes(encrypt_envelope(b'{"desk":2}', FIXTURE_DATA_PATH, "desk2/state.json", nonce=bytes(range(12))))
+    )
+    api = _Api()
+    github = _github(api)
+    try:
+        assert publish(root, github) == "updated"
+        first_pages = api.pages_ref
+        live_state = git_blob_sha((root / "state.json").read_bytes())
+        desk2_sha = git_blob_sha(desk2.read_bytes())
+        first_site = {item["path"]: item["sha"] for item in api.trees[api.commits[first_pages]["tree"]]}
+        assert first_site["web/live/state.json"] == live_state
+        assert first_site["web/live/desk2/state.json"] == desk2_sha
+        assert "web/app.js" not in first_site
+        app = b"desk switch"
+        app_sha = git_blob_sha(app)
+        stale = git_blob_sha(b'{"v":1,"alg":"AES-256-GCM","n":"stale","c":"stale"}')
+        readme = git_blob_sha(b"readme2")
+        api.trees["maintree2"] = [
+            {"path": "README.md", "mode": "100644", "type": "blob", "sha": readme},
+            {"path": "web/app.js", "mode": "100644", "type": "blob", "sha": app_sha},
+            {"path": "web/live/state.json", "mode": "100644", "type": "blob", "sha": stale},
+        ]
+        api.commits["mainsha2"] = {"tree": "maintree2", "parents": ["mainsha"], "message": "app"}
+        api.main_sha = "mainsha2"
+        blobs_before = len(api.blob_posts)
+        assert publish(root, github) == "published"
+        assert len(api.blob_posts) == blobs_before
+        site = {item["path"]: item["sha"] for item in api.trees[api.commits[api.pages_ref]["tree"]]}
+        assert site["web/app.js"] == app_sha
+        assert site["README.md"] == readme
+        assert site["web/live/state.json"] == live_state
+        assert site["web/live/coin/Mint111.json"] == git_blob_sha((root / "coin" / "Mint111.json").read_bytes())
+        assert site["web/live/desk2/state.json"] == desk2_sha
+        assert site["web/live/state.json"] != stale
+        assert api.commits[api.pages_ref]["parents"] == [first_pages]
+        posts = len(api.tree_posts)
+        gets = len(api.commit_gets)
+        pages_after = api.pages_ref
+        assert publish(root, github) == "unchanged"
+        assert api.pages_ref == pages_after
+        assert len(api.tree_posts) == posts
+        assert "mainsha2" not in api.commit_gets[gets:]
+        assert (root / ".main-tip").read_text(encoding="utf-8").strip() == "mainsha2"
+        assert ".main-tip" not in load_live_files(root)
     finally:
         github.close()
