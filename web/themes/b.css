@@ -1,0 +1,92 @@
+/* Theme B — clean minimal light cards.
+   Load after app.css. Leave this file unlinked until it is the chosen look. */
+
+:root {
+  color-scheme: light;
+  --bg: #f3f1ec;
+  --card: #fffcf8;
+  --text: #1d1c19;
+  --muted: #6f6a62;
+  --line: #e4dfd6;
+  --green: #1f7a4d;
+  --red: #a33b32;
+  --blue: #2457c5;
+  --cyan: #2457c5;
+  --orange: #9a5b12;
+  --purple: #5c4d86;
+}
+
+html, body { background: #e7e2d8; color: var(--text); }
+body { font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+#app { background: var(--bg); }
+
+.desks { background: rgba(243, 241, 236, 0.92); backdrop-filter: blur(12px); }
+.desks-track { background: #e6e1d8; height: 48px; }
+.desks-thumb {
+  background: #fffcf8;
+  box-shadow: 0 1px 2px rgba(40, 32, 16, 0.12), 0 4px 12px rgba(40, 32, 16, 0.06);
+}
+.desks button { color: #5e594f; font-weight: 600; }
+.desks button.on { color: #1d1c19; }
+
+.avatar, .bell, .search, .ranges button, .mini, .strip {
+  background: #fffcf8;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.search { border-radius: 12px; }
+.ranges button.on { color: var(--text); background: #fff; }
+.paper { color: var(--green); letter-spacing: 0.12em; font-weight: 650; }
+.odo, .big { font-weight: 640; letter-spacing: -0.045em; color: #161513; }
+.odo span { min-width: 0.55em; }
+.pill { background: #e7f4ec; color: var(--green); }
+.sub { color: var(--muted); }
+.note { color: var(--muted); }
+
+.chart-wrap { background: transparent; }
+canvas.chart { height: 180px; }
+h2 { color: #8a847a; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; font-size: 12px; }
+h2 button, .more, .back { color: var(--blue); }
+
+.card, .hits, .grid div, .toggle {
+  background: var(--card);
+  border: 1px solid #efeae2;
+  border-radius: 18px;
+  box-shadow: 0 8px 24px rgba(60, 46, 20, 0.05);
+}
+.carousel { gap: 12px; }
+.carousel .card { min-width: 80%; }
+.activity .row, .list .row {
+  margin: 0;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+.feed { font-size: 14px; }
+.agent-name { font-weight: 680; }
+.scanner, .auditor, .analyst, .executor, .risk { color: #1d1c19; }
+.status.on { background: var(--green); }
+.ring { background: conic-gradient(var(--green) calc(var(--p) * 1%), #ece7df 0); }
+.ring span { background: var(--card); color: var(--text); }
+.bar { background: #ece7df; }
+.tag.stop { background: #f8e8e6; color: var(--red); }
+.tag.trail { background: #e7f4ec; color: var(--green); }
+.kill b { color: var(--red); }
+
+#tabs {
+  background: rgba(255, 252, 248, 0.94);
+  border-top: 1px solid var(--line);
+  backdrop-filter: blur(16px);
+}
+#tabs button { color: #8a847a; font-weight: 600; }
+#tabs button.on { color: #1d1c19; }
+
+.btn { background: #1d1c19; color: #fffcf8; border-radius: 14px; }
+.btn.sell { background: var(--red); color: white; }
+.disc { background: #e6e1d8; }
+.switch { background: #ddd6cb; }
+.switch.on { background: var(--green); }
+.hits button { color: var(--text); border-top: 1px solid var(--line); }
+details.fold > summary { font-size: 16px; }
+details.fold > summary::after { color: #8a847a; }
+.field input[type="range"] { accent-color: #1d1c19; }
+.error { background: #f8e8e6; }

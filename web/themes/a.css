@@ -1,0 +1,105 @@
+/* Theme A — dark glassy trading terminal.
+   Load after app.css. Leave this file unlinked until it is the chosen look. */
+
+:root {
+  color-scheme: dark;
+  --bg: #071018;
+  --card: rgba(14, 28, 42, 0.62);
+  --text: #e7f6ff;
+  --muted: #8aa4b8;
+  --line: rgba(140, 196, 230, 0.22);
+  --green: #7dffb3;
+  --red: #ff6b8a;
+  --blue: #8fd4ff;
+  --cyan: #b8fff2;
+  --orange: #ffc46b;
+  --purple: #c9b6ff;
+}
+
+html, body { background: #03070c; color: var(--text); }
+body {
+  font: 15px/1.4 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+#app {
+  background:
+    radial-gradient(120% 40% at 50% -10%, rgba(80, 160, 210, 0.18), transparent 55%),
+    var(--bg);
+}
+
+.desks { background: rgba(7, 16, 24, 0.78); backdrop-filter: blur(16px); }
+.desks-track {
+  height: 44px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.desks-thumb {
+  background: rgba(186, 230, 255, 0.18);
+  border: 1px solid rgba(186, 230, 255, 0.35);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.desks button { color: #9fb4c4; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+.desks button.on { color: #f4fbff; }
+
+.nav { padding-top: 4px; }
+.avatar, .bell { background: rgba(255, 255, 255, 0.06); border: 1px solid var(--line); }
+.brand { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 600; letter-spacing: 0; }
+.search {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+.paper { color: var(--green); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.14em; }
+.odo, .big { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 560; letter-spacing: -0.03em; }
+.odo span { min-width: 0; text-align: left; }
+.pill { background: rgba(125, 255, 179, 0.12); border: 1px solid rgba(125, 255, 179, 0.35); }
+
+.chart-wrap {
+  margin: 8px 16px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.28);
+}
+canvas.chart { height: 168px; }
+.ranges button, .mini {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+.ranges button.on { color: var(--green); border-color: rgba(125, 255, 179, 0.5); }
+
+h2 { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.08em; text-transform: uppercase; font-size: 11px; }
+h2 button, .more { color: var(--cyan); }
+
+.card, .hits, .grid div, .toggle {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(18px);
+}
+.carousel .card { min-width: 82%; }
+.feed, .row, .layer-row, .field, .note { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.activity .row, .list .row { padding: 8px 0; margin: 0; }
+.strip { background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line); }
+.ring { background: conic-gradient(var(--cyan) calc(var(--p) * 1%), rgba(255, 255, 255, 0.08) 0); }
+.ring span { background: #0c1824; }
+
+#tabs {
+  background: rgba(7, 16, 24, 0.82);
+  border-top: 1px solid var(--line);
+  backdrop-filter: blur(18px);
+}
+#tabs button { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+#tabs button.on { color: var(--green); }
+
+.btn { border-radius: 10px; background: var(--green); color: #04210f; letter-spacing: 0.04em; }
+.btn.sell { background: var(--red); color: #2a0410; }
+.hits button { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+details.fold > summary { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.06em; text-transform: uppercase; font-size: 12px; }
