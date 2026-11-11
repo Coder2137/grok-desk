@@ -25,7 +25,7 @@ def redact(text: str) -> str:
 
 
 def file_logger(name: str, filename: str) -> logging.Logger:
-    path = Path("logs") / filename
+    path = Path(os.environ.get("LOG_DIR") or "logs") / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)

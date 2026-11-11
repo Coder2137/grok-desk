@@ -94,8 +94,22 @@ def _hash_ok(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
+def live_relative(name: str) -> str:
+    prefix = (os.environ.get("DESK_LIVE_PREFIX") or "").strip().strip("/")
+    if not prefix:
+        return name
+    return f"{prefix}/{name}"
+
+
+def _hash_file() -> Path:
+    prefix = (os.environ.get("DESK_LIVE_PREFIX") or "").strip().strip("/")
+    if prefix:
+        return live_root() / prefix / PLAIN_HASHES
+    return live_root() / PLAIN_HASHES
+
+
 def load_plain_hashes() -> dict[str, str]:
-    path = live_root() / PLAIN_HASHES
+    path = _hash_file()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
@@ -111,23 +125,24 @@ def load_plain_hashes() -> dict[str, str]:
 
 def save_plain_hashes(hashes: dict[str, str]) -> None:
     clean = {key: value for key, value in sorted(hashes.items()) if is_live_path(key) and _hash_ok(value)}
-    _write_bytes(live_root() / PLAIN_HASHES, json.dumps(clean, separators=(",", ":")).encode("utf-8"))
+    _write_bytes(_hash_file(), json.dumps(clean, separators=(",", ":")).encode("utf-8"))
 
 
 def _emit(relative: str, payload, plain_root: Path, secret: str, hashes: dict[str, str]) -> str | None:
-    if not is_live_path(relative):
+    stored = live_relative(relative)
+    if not is_live_path(stored):
         return None
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     digest = _plain_digest(raw)
-    plain_path = _under(plain_root, relative)
-    live_path = _under(live_root(), relative)
-    if hashes.get(relative) == digest and plain_path.is_file() and live_path.is_file():
-        return relative
-    envelope = envelope_bytes(encrypt_envelope(raw, secret, relative))
+    plain_path = _under(plain_root, stored)
+    live_path = _under(live_root(), stored)
+    if hashes.get(stored) == digest and plain_path.is_file() and live_path.is_file():
+        return stored
+    envelope = envelope_bytes(encrypt_envelope(raw, secret, stored))
     _write_bytes(plain_path, raw)
     _write_bytes(live_path, envelope)
-    hashes[relative] = digest
-    return relative
+    hashes[stored] = digest
+    return stored
 
 
 def _public_rpc(url: str) -> str:

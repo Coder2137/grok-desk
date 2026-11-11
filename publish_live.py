@@ -162,14 +162,21 @@ def require_envelope(name: str, raw: bytes) -> None:
         raise PublishError(f"{name} is not an encrypted envelope")
 
 
+def _live_candidates(root: Path, prefix: str) -> list[Path]:
+    base = root / prefix if prefix else root
+    candidates = [base / name for name in _CORE]
+    coin = base / "coin"
+    if coin.is_dir() and _inside(root, coin):
+        candidates.extend(sorted(path for path in coin.iterdir() if path.is_file() and path.suffix == ".json"))
+    return candidates
+
+
 def load_live_files(root: Path) -> dict[str, bytes]:
     root = Path(root)
     if not root.is_dir():
         return {}
-    candidates = [root / name for name in _CORE]
-    coin = root / "coin"
-    if coin.is_dir() and _inside(root, coin):
-        candidates.extend(sorted(path for path in coin.iterdir() if path.is_file() and path.suffix == ".json"))
+    candidates = _live_candidates(root, "")
+    candidates.extend(_live_candidates(root, "desk2"))
     found: dict[str, bytes] = {}
     for path in candidates:
         if not path.is_file() or not _inside(root, path):

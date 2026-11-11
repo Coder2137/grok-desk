@@ -174,16 +174,20 @@ def judge(metrics: dict, settings: dict, runners: list[dict]) -> tuple[str, str 
 
 
 class Scanner:
-    def __init__(self, db, settings, bus) -> None:
+    def __init__(self, db, settings, bus, source: bool = True) -> None:
         self.db = db
         self.settings = settings
         self.bus = bus
+        self.source = source
         self.waiting: dict[str, dict] = {}
         self._sample_written = False
         self._ack_sample_noted = False
 
     async def run(self) -> None:
-        await asyncio.gather(self._socket(), self._poll())
+        if self.source:
+            await asyncio.gather(self._socket(), self._poll())
+        else:
+            await asyncio.gather(self._follow(), self._poll())
 
     async def _socket(self) -> None:
         backoff = 1
@@ -198,14 +202,37 @@ class Scanner:
                         except asyncio.TimeoutError:
                             log(LOG, f"{iso(utc_now())} websocket silent 120s reconnect")
                             break
-                        self.ingest_message(raw)
+                        self.ingest_message(raw, relay=True)
             except Exception as exc:
                 log(LOG, f"{iso(utc_now())} websocket closed {exc.__class__.__name__} backoff {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(60, backoff * 2)
             self.db.heartbeat("scanner")
 
-    def ingest_message(self, raw) -> None:
+    async def _follow(self) -> None:
+        from feed import load_offset
+
+        offset = load_offset()
+        while True:
+            try:
+                offset = self.follow_once(offset)
+            except Exception as exc:
+                log(LOG, f"{iso(utc_now())} feed {exc.__class__.__name__}")
+            self.db.heartbeat("scanner")
+            await asyncio.sleep(0.5)
+
+    def follow_once(self, offset: int | None = None) -> int:
+        from feed import load_offset, read_new, store_offset
+
+        if offset is None:
+            offset = load_offset()
+        lines, offset = read_new(offset)
+        for line in lines:
+            self.ingest_message(line, relay=False)
+        store_offset(offset)
+        return offset
+
+    def ingest_message(self, raw, relay: bool = False) -> None:
         try:
             message = json.loads(raw) if isinstance(raw, str) else raw
         except ValueError:
@@ -221,6 +248,10 @@ class Scanner:
         fields = migration_frame(message)
         if fields is None:
             return
+        if relay:
+            from feed import append_migration
+
+            append_migration(message)
         self._save_sample(message)
         if not fields["mint"]:
             log(LOG, f"{iso(utc_now())} migration frame mint unset")
