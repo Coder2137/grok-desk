@@ -10,7 +10,7 @@ import websockets
 from config import iso, parse_iso, utc_now
 from fields import dex_fields, migration_frame, pumpswap_pair
 from logutil import file_logger, log
-from sources import DexRateLimit, dexscreener_batch
+from sources import RUG_REPORT, DexRateLimit, dexscreener_batch
 
 LOG = file_logger("scanner", "scanner.log")
 WS_URL = "wss://pumpportal.fun/api/data"
@@ -69,6 +69,13 @@ def copycat_of(name: str, symbol: str, runners: list[dict]) -> str | None:
 
 
 def top10_pct(accounts: list[dict], supply: float, pool: str | None, curve: str | None) -> float | None:
+    """Share of supply held by the ten largest accounts.
+
+    Accounts whose address or owner equals the pool or the bonding curve are
+    left out. That drops the PumpSwap LP token account, whose owner is the
+    pool from DexScreener. Burn addresses are not removed: this desk has no
+    burn list, and the holder feed does not label them.
+    """
     if supply is None or supply <= 0 or accounts is None:
         return None
     kept = []
@@ -84,6 +91,48 @@ def top10_pct(accounts: list[dict], supply: float, pool: str | None, curve: str 
         kept.append(float(row["balance"]))
     kept.sort(reverse=True)
     return sum(kept[:10]) / float(supply) * 100.0
+
+
+def holder_rows(top_holders) -> list[dict] | None:
+    """RugCheck topHolders rows. `pct` is already a percent of supply.
+
+    A missing list, an empty list, or rows with no pct stay missing. Nothing
+    here fills a gap with zero.
+    """
+    if not isinstance(top_holders, list) or not top_holders:
+        return None
+    rows = []
+    for item in top_holders:
+        if not isinstance(item, dict) or "pct" not in item or item.get("pct") is None:
+            continue
+        try:
+            pct = float(item["pct"])
+        except (TypeError, ValueError):
+            continue
+        owner = item.get("owner")
+        address = item.get("address")
+        rows.append(
+            {
+                "owner": None if owner is None else str(owner),
+                "address": None if address is None else str(address),
+                "balance": pct,
+            }
+        )
+    return rows or None
+
+
+def top10_from_holders(top_holders, pool: str | None, curve: str | None) -> float | None:
+    rows = holder_rows(top_holders)
+    if rows is None:
+        return None
+    return top10_pct(rows, 100.0, pool, curve)
+
+
+def _top10_result(fetched) -> tuple[float | None, str | None]:
+    if isinstance(fetched, tuple) and len(fetched) == 2:
+        pct, cause = fetched
+        return pct, None if cause is None else str(cause)
+    return fetched, None
 
 
 def judge(metrics: dict, settings: dict, runners: list[dict]) -> tuple[str, str | None]:
@@ -110,6 +159,9 @@ def judge(metrics: dict, settings: dict, runners: list[dict]) -> tuple[str, str 
     age = metrics.get("age_min")
     if top is None:
         if age is not None and age > float(settings["scanner.max_wait_min"]):
+            cause = metrics.get("top10_error")
+            if cause:
+                return "kill", f"top10 unavailable: {cause}"
             return "kill", "never qualified"
         return "wait", None
     if age is None:
@@ -122,16 +174,20 @@ def judge(metrics: dict, settings: dict, runners: list[dict]) -> tuple[str, str 
 
 
 class Scanner:
-    def __init__(self, db, settings, bus) -> None:
+    def __init__(self, db, settings, bus, source: bool = True) -> None:
         self.db = db
         self.settings = settings
         self.bus = bus
+        self.source = source
         self.waiting: dict[str, dict] = {}
         self._sample_written = False
         self._ack_sample_noted = False
 
     async def run(self) -> None:
-        await asyncio.gather(self._socket(), self._poll())
+        if self.source:
+            await asyncio.gather(self._socket(), self._poll())
+        else:
+            await asyncio.gather(self._follow(), self._poll())
 
     async def _socket(self) -> None:
         backoff = 1
@@ -146,14 +202,37 @@ class Scanner:
                         except asyncio.TimeoutError:
                             log(LOG, f"{iso(utc_now())} websocket silent 120s reconnect")
                             break
-                        self.ingest_message(raw)
+                        self.ingest_message(raw, relay=True)
             except Exception as exc:
                 log(LOG, f"{iso(utc_now())} websocket closed {exc.__class__.__name__} backoff {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(60, backoff * 2)
             self.db.heartbeat("scanner")
 
-    def ingest_message(self, raw) -> None:
+    async def _follow(self) -> None:
+        from feed import load_offset
+
+        offset = load_offset()
+        while True:
+            try:
+                offset = self.follow_once(offset)
+            except Exception as exc:
+                log(LOG, f"{iso(utc_now())} feed {exc.__class__.__name__}")
+            self.db.heartbeat("scanner")
+            await asyncio.sleep(0.5)
+
+    def follow_once(self, offset: int | None = None) -> int:
+        from feed import load_offset, read_new, store_offset
+
+        if offset is None:
+            offset = load_offset()
+        lines, offset = read_new(offset)
+        for line in lines:
+            self.ingest_message(line, relay=False)
+        store_offset(offset)
+        return offset
+
+    def ingest_message(self, raw, relay: bool = False) -> None:
         try:
             message = json.loads(raw) if isinstance(raw, str) else raw
         except ValueError:
@@ -169,6 +248,10 @@ class Scanner:
         fields = migration_frame(message)
         if fields is None:
             return
+        if relay:
+            from feed import append_migration
+
+            append_migration(message)
         self._save_sample(message)
         if not fields["mint"]:
             log(LOG, f"{iso(utc_now())} migration frame mint unset")
@@ -267,11 +350,21 @@ class Scanner:
             if migrated:
                 age = (now - parse_iso(migrated)).total_seconds() / 60.0
             if known and coin.get("top10") is None:
-                coin["top10"] = await self._top10(mint, (dex or {}).get("pool") or coin.get("pool"), coin.get("curve"))
+                pct, cause = _top10_result(
+                    await self._top10(mint, (dex or {}).get("pool") or coin.get("pool"), coin.get("curve"))
+                )
+                if pct is None:
+                    if cause:
+                        coin["top10_error"] = cause
+                        log(LOG, f"{iso(now)} {mint} top10 unavailable: {cause}")
+                else:
+                    coin["top10"] = pct
+                    coin.pop("top10_error", None)
             metrics = {
                 "known": known,
                 "liquidity": None if not dex else dex.get("liquidityUsd"),
                 "top10": coin.get("top10"),
+                "top10_error": coin.get("top10_error"),
                 "h1": None if not dex else dex.get("priceChangeH1"),
                 "name": None if not dex else dex.get("name"),
                 "symbol": None if not dex else dex.get("symbol"),
@@ -286,35 +379,41 @@ class Scanner:
             self.waiting.pop(mint, None)
             self.bus.waiting.discard(mint)
 
-    async def _top10(self, mint: str, pool: str | None, curve: str | None):
-        from sources import rpc
-
-        url = self.settings.get("desk.rpc_url")
+    async def _fetch_report(self, mint: str) -> tuple[dict | None, str | None]:
         try:
             async with httpx.AsyncClient() as client:
-                supply_body = await rpc(url, "getAccountInfo", [mint, {"encoding": "jsonParsed"}], client)
-                largest_body = await rpc(url, "getTokenLargestAccounts", [mint], client)
-                from fields import largest_account_rows, rpc_mint_account, rpc_supply_ui, token_account_fields
+                response = await client.get(RUG_REPORT.format(mint=mint), timeout=15)
+        except Exception as exc:
+            return None, exc.__class__.__name__
+        if response.status_code >= 400:
+            return None, f"rugcheck http {response.status_code}"
+        try:
+            body = response.json()
+        except ValueError:
+            return None, "rugcheck report"
+        if not isinstance(body, dict):
+            return None, "rugcheck report"
+        return body, None
 
-                supply = rpc_supply_ui(rpc_mint_account(supply_body)) if supply_body else None
-                rows = largest_account_rows(largest_body) if largest_body else None
-                if supply is None or rows is None:
-                    return None
-                addresses = [row["address"] for row in rows]
-                if not addresses:
-                    return 0.0
-                parsed = await rpc(url, "getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}], client)
-                value = (parsed or {}).get("result", {}).get("value") if isinstance(parsed, dict) else None
-                if not isinstance(value, list):
-                    return None
-                accounts = []
-                for address, account in zip(addresses, value):
-                    fields = token_account_fields({"account": account} if isinstance(account, dict) else {})
-                    fields["address"] = address
-                    accounts.append(fields)
-                return top10_pct(accounts, supply, pool, curve)
-        except Exception:
-            return None
+    async def _top10(self, mint: str, pool: str | None, curve: str | None):
+        """Holder concentration from RugCheck topHolders.
+
+        The public Solana RPC answers getTokenLargestAccounts with HTTP 429,
+        and that used to come back as a silent null. RugCheck's report needs
+        no key and already lists each holder's percent of supply. Pool and
+        curve accounts are excluded by top10_pct. A failed read stays null
+        and names the cause so a later poll inside scanner.max_wait_min can
+        try again.
+        """
+        body, cause = await self._fetch_report(mint)
+        if cause or not isinstance(body, dict):
+            return None, cause or "rugcheck report"
+        if not isinstance(body.get("topHolders"), list) or not body.get("topHolders"):
+            return None, "topHolders missing"
+        pct = top10_from_holders(body.get("topHolders"), pool, curve)
+        if pct is None:
+            return None, "topHolders missing"
+        return pct, None
 
     def _remember_names(self, mint, dex) -> None:
         if dex.get("name") or dex.get("symbol"):

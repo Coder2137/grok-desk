@@ -27,7 +27,15 @@ def is_live_path(relative: str) -> bool:
         return False
     if relative in _CORE:
         return True
-    return len(parts) == 2 and parts[0] == "coin" and parts[1].endswith(".json") and len(parts[1]) > len(".json")
+    if len(parts) == 2 and parts[0] == "coin" and _coin_file(parts[1]):
+        return True
+    if len(parts) == 2 and parts[0] == "desk2" and parts[1] in _CORE:
+        return True
+    return len(parts) == 3 and parts[0] == "desk2" and parts[1] == "coin" and _coin_file(parts[2])
+
+
+def _coin_file(name: str) -> bool:
+    return name.endswith(".json") and len(name) > len(".json") and name not in (".json",)
 
 
 def encrypt_envelope(plaintext: bytes, data_path: str, aad_name: str, nonce: bytes | None = None) -> dict:

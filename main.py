@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,8 @@ from api import Writer, json_root
 from bus import Bus
 from config import DeskSettings, utc_now
 from db import Database
+from instance import apply_instance, resolve_instance, setting_overrides
+from secrets_env import force_live_refused, load_user_secrets
 from fields import dex_fields, pumpswap_pair
 from logutil import file_logger, log
 from sources import dexscreener_batch
@@ -108,12 +111,19 @@ async def heart(db, settings, bus) -> None:
 
 async def run() -> None:
     load_env()
+    name = resolve_instance()
+    if name == "desk2":
+        load_user_secrets()
+    apply_instance(name)
+    if name == "desk2" and force_live_refused(os.environ):
+        print("FORCE_LIVE is refused.", file=sys.stderr)
+        raise SystemExit(1)
     db = Database(os.environ.get("DESK_DB", "var/desk.db"))
-    settings = DeskSettings(db)
+    settings = DeskSettings(db, overrides=setting_overrides(name))
     if not (os.environ.get("TYPESAFE_API_KEY") or "").strip() and settings.get("analyst.mode") != "rules":
         settings.set("analyst.mode", "rules", "boot")
     bus = Bus()
-    scanner = Scanner(db, settings, bus)
+    scanner = Scanner(db, settings, bus, source=name != "desk2")
     auditor = Auditor(db, settings, bus)
     analyst = Analyst(db, settings, bus, api_key=os.environ.get("TYPESAFE_API_KEY") or "")
     executor = Executor(db, settings, bus)
@@ -139,7 +149,7 @@ async def run() -> None:
     ]
     if os.environ.get("LOCAL_API") == "1":
         tasks.append(serve_local())
-    log(LOG, "desk up")
+    log(LOG, "desk up" if name == "desk1" else "desk2 up")
     await asyncio.gather(*tasks)
 
 

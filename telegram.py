@@ -46,10 +46,17 @@ class Telegram:
         self.offset = 0
         self._confirm_auditor = False
 
+    def enabled(self) -> bool:
+        return os.environ.get("DESK_TELEGRAM") != "0"
+
     async def run(self) -> None:
         await asyncio.gather(self._poll(), self._events())
 
     async def _poll(self) -> None:
+        if not self.enabled():
+            log(LOG, "telegram disabled")
+            while True:
+                await asyncio.sleep(3600)
         if not self.token:
             log(LOG, "telegram token missing")
             while True:
@@ -72,6 +79,13 @@ class Telegram:
                 self.db.heartbeat("telegram")
 
     async def _events(self) -> None:
+        if not self.enabled():
+            while True:
+                event = await self.bus.events.get()
+                ack = event.get("ack")
+                if ack is not None and not ack.done():
+                    ack.set_result(False)
+            return
         async with httpx.AsyncClient(timeout=20) as client:
             while True:
                 event = await self.bus.events.get()

@@ -294,11 +294,11 @@ def iso(moment: datetime | None = None) -> str:
 class DeskSettings:
     """Live settings stored in SQLite. Env seeds the handle once, never a token."""
 
-    def __init__(self, db, environ=None) -> None:
+    def __init__(self, db, environ=None, overrides=None) -> None:
         import os
 
         self.db = db
-        self.db.ensure_defaults()
+        self.db.ensure_defaults(overrides)
         env = environ if environ is not None else os.environ
         if env.get("FOMO_HANDLE") and not self.db.get_setting("desk.fomo_handle"):
             ok, _msg, value = validate("desk.fomo_handle", env["FOMO_HANDLE"])

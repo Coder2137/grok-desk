@@ -31,6 +31,16 @@ Set these in the environment or in a gitignored `.env`. Do not commit the values
 
 `python report.py` writes the morning page to `var/report/morning.html`. Run it on the morning schedule. It does not print secret values.
 
+## Desk 2
+
+A second paper desk can run beside this one. It does not change desk 1's database, $40,000 liquidity floor, or Telegram. Start it with `DESK_INSTANCE=desk2` or `python main.py --instance desk2`. The Windows launchers are `run-desk2.ps1` and `GrokDesk2.cmd`.
+
+Desk 2 uses `var/desk2.db`, plaintext under `var/desk2/json`, and a $200 paper stack. Its scanner liquidity floor is $10,000. Every other filter matches desk 1. `run-desk2.ps1` loads `%USERPROFILE%\.desk-secrets\env` the same way as desk 1 and never prints those values. `FORCE_LIVE` is refused. `DESK_INSTANCE` stays `desk2` and `DESK_TELEGRAM` stays `0`, even if the secrets file says otherwise, so desk 2 does not send Telegram. Logs go to `logs/desk2/`. `GrokDesk2.cmd` can sit in the Startup folder: it runs `%USERPROFILE%\grok-desk\run-desk2.ps1`, or `%DESK_HOME%\run-desk2.ps1` when `DESK_HOME` is set.
+
+Only desk 1 opens the PumpPortal websocket. It appends each migration frame to `var/feed/migrations.jsonl`. Desk 2 reads that file. If desk 2 is stopped, desk 1 keeps appending and does not wait on it.
+
+Encrypted files for desk 2 are `var/live/desk2/state.json`, `chart.json`, `activity.json`, and `coin/<mint>.json`. The same publisher sends them with the desk 1 files. The phone page has Desk 1 and Desk 2 switches. The decrypt key is still the stored path. The extra data for a desk 2 file is its path, such as `desk2/state.json`.
+
 A PumpPortal migration frame uses `mint`, `signature`, and `pool`. On the captured frame `pool` was the venue label `pump-amm`, not an account address, and `creator` was absent so it stays null. The account address used later is the DexScreener pair address when that pair is known. The subscribe reply `Subscribed to 'migration' events.` is not a migration frame. `var/migration_keys.json` on the operator machine can override those names. That file stays out of git.
 
 ## Phone
@@ -43,13 +53,13 @@ FOMO URLs are built only in `links.py`.
 
 ## Live branch
 
-The writer stores those envelopes under `var/live/` (or `LIVE_ROOT`). That directory stays on the operator machine.
+The writer stores those envelopes under `var/live/` (or `LIVE_ROOT`). That directory stays on the operator machine. It also writes `var/live/.plain-hashes.json`, a map of sha256 hashes of the plaintext, and skips re-encrypting a file whose plaintext did not change. That file is not published and holds no plaintext and no key. Leave it in place across restarts.
 
 ```bash
 python publish_live.py
 ```
 
-The script reads `GH_TOKEN` or `GITHUB_TOKEN` from the environment. It updates `live-data` so that branch contains only the encrypted files, then adds a `pages-src` commit whose tree is current `main` with those files under `web/live`. Pushing `pages-src` runs the Pages workflow. `actions/deploy-pages` sends that commit's SHA as `pages_build_version`, which is the version GitHub Pages stores. Run the script about once a minute. A commit to `main` is not required for each refresh. Set `GITHUB_REPOSITORY` to `owner/name` when the checkout has no `origin` remote.
+The script reads `GH_TOKEN` or `GITHUB_TOKEN` from the environment. It updates `live-data` with a commit based on that branch's current tree, uploading only envelopes whose blob changed. A small update sends each changed file as its own blob, four at a time. A catch-up of more than 40 files sends inline content in tree requests of 150 files, then `pages-src` references those blob ids without sending the bytes again. Unchanged coin files stay on the branch and are not sent again. If GitHub returns a rate limit, the script writes `var/publish-backoff-until` and skips later runs until that time. That file is not published. A file removed locally is left in place. It then adds a `pages-src` commit whose parent is the previous `pages-src` tip. When `main` has moved, that commit's tree is the new `main` tree plus the current `web/live` ciphertext, so a site change on `main` reaches Pages and `main`'s own `web/live` files do not replace the ciphertext. The main tip is remembered in `var/live/.main-tip` and the main tree is not read again until it changes. When `main` has not moved, only changed `web/live` blobs are sent. Pushing `pages-src` runs the Pages workflow. `actions/deploy-pages` sends that commit's SHA as `pages_build_version`, which is the version GitHub Pages stores. Run the script about once a minute. A commit to `main` is not required for each refresh. Set `GITHUB_REPOSITORY` to `owner/name` when the checkout has no `origin` remote.
 
 The token needs permission to push `live-data` and `pages-src`. It does not need permission to dispatch workflows. Keep it in the operator environment. Dispatching the Pages workflow on `main` reuses `main`'s SHA. A quiet dispatch of that kind uploaded a new artifact and reported success while the public site kept serving the older artifact for that same SHA. The script does not do that.
 

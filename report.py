@@ -8,6 +8,7 @@ from pathlib import Path
 
 from config import DeskSettings, iso, utc_now
 from db import Database
+from instance import apply_instance, resolve_instance, setting_overrides
 from links import coin_url
 from telegram import _equity
 
@@ -67,9 +68,12 @@ def _esc(value) -> str:
 
 
 def main() -> None:
+    name = resolve_instance()
+    apply_instance(name)
     db = Database(os.environ.get("DESK_DB", "var/desk.db"))
-    settings = DeskSettings(db)
-    out = Path(os.environ.get("REPORT_PATH", "var/report/morning.html"))
+    settings = DeskSettings(db, overrides=setting_overrides(name))
+    default_out = "var/report/morning.html" if name == "desk1" else "var/desk2/morning.html"
+    out = Path(os.environ.get("REPORT_PATH", default_out))
     path = write_report(db, settings, out)
     print(path.name)
 
