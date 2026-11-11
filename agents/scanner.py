@@ -295,6 +295,10 @@ class Scanner:
         )
         self.waiting[mint] = coin
         self.bus.waiting.add(mint)
+        try:
+            asyncio.get_running_loop().create_task(self._snapshot_dev(mint))
+        except RuntimeError:
+            return
 
     async def _poll(self) -> None:
         while True:
@@ -336,6 +340,7 @@ class Scanner:
         runners = [dict(row) for row in self.db.runners_for(day)]
         now = utc_now()
         for mint in list(self.waiting):
+            await self._snapshot_dev(mint)
             coin = self.waiting[mint]
             dex = by_mint.get(mint)
             known = dex is not None
@@ -378,6 +383,35 @@ class Scanner:
             self._emit(mint, coin, dex, metrics, verdict, reason, now)
             self.waiting.pop(mint, None)
             self.bus.waiting.discard(mint)
+
+    async def _snapshot_dev(self, mint: str) -> None:
+        """Record the dev wallet and balance as soon as the coin is admitted.
+
+        PumpPortal migration frames do not include the creator. RugCheck's
+        report does, with no API key. That first balance is the migration
+        baseline. A later read is not written over it.
+        """
+        coin = self.db.coin(mint)
+        if coin and coin["creator"] and coin["creator_balance_at_migration"] is not None:
+            return
+        try:
+            async with httpx.AsyncClient() as client:
+                from sources import rug_report
+
+                report = await rug_report(mint, client)
+        except Exception as exc:
+            log(LOG, f"{mint} dev snapshot {exc.__class__.__name__}")
+            return
+        if not isinstance(report, dict):
+            return
+        from fields import rug_report_fields
+
+        fields = rug_report_fields(report)
+        creator = fields.get("creator")
+        balance = fields.get("creatorBalance")
+        if not creator or balance is None:
+            return
+        self.db.upsert_coin(mint=mint, creator=creator, creator_balance_at_migration=balance)
 
     async def _fetch_report(self, mint: str) -> tuple[dict | None, str | None]:
         try:
