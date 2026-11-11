@@ -48,14 +48,14 @@ def _facts():
     }
 
 
-def test_recorded_migration_runs_paper_without_an_order():
+def test_recorded_migration_runs_paper_without_an_order(tmp_path):
     audit = audit_from_facts(_facts())
     assert audit["passed"] is True
     scored = rules_scores(FIXTURE["dex"], 0, defaults())
     assert scored["passed"] is True
 
     async def run():
-        db = Database(Path("var") / "pytest-replay.db")
+        db = Database(tmp_path / "pytest-replay.db")
         settings = DeskSettings(db)
         bus = Bus()
 
@@ -100,7 +100,6 @@ def test_recorded_migration_runs_paper_without_an_order():
         assert pnl != 0 or fees > 0
     finally:
         db.close()
-        Path("var/pytest-replay.db").unlink(missing_ok=True)
 
 
 def test_repo_has_no_secret_material():
