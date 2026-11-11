@@ -18,6 +18,7 @@ from logutil import file_logger, log
 from sources import TOKEN_2022, TOKEN_PROGRAM, RpcRefused, rpc, rug_graph, rug_report
 
 LOG = file_logger("auditor", "auditor.log")
+HEARTBEAT_S = 30
 
 LAYER_NAMES = {
     1: "Mint authority",
@@ -168,9 +169,18 @@ def audit_from_facts(facts: dict) -> dict:
     balance = facts.get("creator_balance")
     migration_balance = facts.get("creator_balance_at_migration")
     if not creator or balance is None or migration_balance is None:
-        layers.append(_layer(3, False, "no data: dev", "rpc"))
+        cause = facts.get("dev_error")
+        if not cause:
+            if not creator:
+                cause = "creator absent"
+            elif migration_balance is None:
+                cause = "migration balance missing"
+            else:
+                cause = "balance missing"
+        value = f"no data: dev ({cause})"
+        layers.append(_layer(3, False, value, "rpc"))
         _rest(4, layers)
-        return finish(False, "no data: dev", 3)
+        return finish(False, value, 3)
     dev_pct = _pct(balance, supply)
     if balance + 1e-9 < float(migration_balance):
         layers.append(_layer(3, False, "dev sold", "rpc"))
@@ -310,7 +320,11 @@ class Auditor:
 
     async def run(self) -> None:
         while True:
-            message = await self.bus.auditor.get()
+            try:
+                message = await asyncio.wait_for(self.bus.auditor.get(), timeout=HEARTBEAT_S)
+            except asyncio.TimeoutError:
+                self.db.heartbeat("auditor")
+                continue
             try:
                 if self.settings.get("auditor.enabled") and not self.settings.get("agent.auditor.paused"):
                     await self.handle(message)
@@ -375,25 +389,25 @@ class Auditor:
                 lambda: rpc(rpc_url, "getAccountInfo", [mint, {"encoding": "jsonParsed"}], client),
                 retries,
             )
+            from fields import rug_report_fields
+
+            rug_fields = rug_report_fields(report) if isinstance(report, dict) else {}
             creator = None
             if coin and coin["creator"]:
                 creator = coin["creator"]
-            elif isinstance(report, dict):
-                from fields import rug_report_fields
-
-                creator = rug_report_fields(report).get("creator")
+            else:
+                creator = rug_fields.get("creator")
+            migration_balance = coin["creator_balance_at_migration"] if coin else None
             creator_balance = None
-            if creator:
-                owned = await self._retry(
-                    lambda: rpc(
-                        rpc_url,
-                        "getTokenAccountsByOwner",
-                        [creator, {"mint": mint}, {"encoding": "jsonParsed"}],
-                        client,
-                    ),
-                    retries,
+            dev_error = None
+            if not creator:
+                dev_error = "creator absent"
+            elif migration_balance is None:
+                dev_error = "migration balance missing"
+            else:
+                creator_balance, dev_error = await self._creator_balance(
+                    client, rpc_url, creator, mint, rug_fields, retries
                 )
-                creator_balance = _sum_owner_balance(owned)
             largest = await self._largest(rpc_url, mint, client, retries)
             accounts = None
             delegations_down = bool(self.settings.get("desk.layer8_down"))
@@ -420,7 +434,6 @@ class Auditor:
         nodes, links, links_missing, empty_network = graph_nodes_links(graph)
         lp = rug_lp(report or {}, message.get("pool") or (coin["pool"] if coin else None))
         migrated = coin["migrated_at"] if coin else message.get("migratedAt")
-        migration_balance = coin["creator_balance_at_migration"] if coin else None
         return {
             "mint": mint,
             "ts": iso(utc_now()),
@@ -432,6 +445,7 @@ class Auditor:
             "creator": creator,
             "creator_balance": creator_balance,
             "creator_balance_at_migration": migration_balance,
+            "dev_error": dev_error,
             "supply_ui": rpc_supply_ui(mint_account),
             "mint_authority": mint_account["mintAuthority"],
             "freeze_authority": mint_account["freezeAuthority"],
@@ -448,6 +462,51 @@ class Auditor:
             "delegations_down": delegations_down,
             "delegation_accounts": accounts,
         }
+
+    async def _creator_balance(self, client, rpc_url, creator, mint, rug_fields, retries):
+        """Current dev balance. RugCheck is only a fallback for this reading.
+
+        The migration baseline stays the balance stored when the coin was
+        admitted. A later RugCheck number is not copied into that baseline.
+        """
+        last = "rpc unavailable"
+        for attempt in range(max(1, retries)):
+            try:
+                response = await client.post(
+                    rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getTokenAccountsByOwner",
+                        "params": [creator, {"mint": mint}, {"encoding": "jsonParsed"}],
+                    },
+                    timeout=20,
+                )
+            except Exception as exc:
+                last = exc.__class__.__name__
+            else:
+                if response.status_code == 429:
+                    last = "rpc 429"
+                elif response.status_code >= 400:
+                    last = f"rpc http {response.status_code}"
+                else:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                        last = "rpc report"
+                    if isinstance(body, dict) and not body.get("error"):
+                        total = _sum_owner_balance(body)
+                        if total is not None:
+                            return total, None
+                        last = "balance missing"
+                    elif isinstance(body, dict) and body.get("error"):
+                        last = "rpc error"
+            if attempt + 1 < retries:
+                await asyncio.sleep(min(8, 2 ** attempt))
+        if rug_fields.get("creator") == creator and rug_fields.get("creatorBalance") is not None:
+            return rug_fields["creatorBalance"], None
+        return None, last
 
     async def _retry(self, fn, retries: int):
         last = None

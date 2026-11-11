@@ -218,7 +218,7 @@ def test_missing_freeze_creator_and_holders_fail_closed(tmp_path):
             db.clear_audit(PASS_MINT)
             await reject(present_freeze, "freeze not revoked")
             db.clear_audit(PASS_MINT)
-            await reject(missing_creator, "no data: dev")
+            await reject(missing_creator, "no data: dev (creator absent)")
 
         asyncio.run(run())
         assert db.signals_since("1970") == []
