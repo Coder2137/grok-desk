@@ -156,9 +156,12 @@
     const change = Number(data.dayChangePct || 0);
     const hits = filteredCoins();
     return `
-      <div class="desks">
-        <button type="button" data-desk="desk1" class="${deskSlot() === "desk1" ? "on" : ""}">Desk 1</button>
-        <button type="button" data-desk="desk2" class="${deskSlot() === "desk2" ? "on" : ""}">Desk 2</button>
+      <div class="desks ${deskSlot()}" role="tablist" aria-label="Desk">
+        <div class="desks-track">
+          <span class="desks-thumb" aria-hidden="true"></span>
+          <button type="button" role="tab" data-desk="desk1" aria-selected="${deskSlot() === "desk1"}" class="${deskSlot() === "desk1" ? "on" : ""}">Desk 1</button>
+          <button type="button" role="tab" data-desk="desk2" aria-selected="${deskSlot() === "desk2"}" class="${deskSlot() === "desk2" ? "on" : ""}">Desk 2</button>
+        </div>
       </div>
       <div class="nav">
         <button class="avatar" id="go-account" aria-label="Account">•</button>
