@@ -15,15 +15,36 @@
     offline: false,
     retry: 15,
     timer: null,
-    seen: Number(localStorage.getItem(localStorage.getItem("deskSlot") === "desk2" ? "deskSeen2" : "deskSeen") || 0),
+    seen: Number(localStorage.getItem(localStorage.getItem("deskSlot") === "desk2" ? "deskSeen2" : localStorage.getItem("deskSlot") === "desk3" ? "deskSeen3" : "deskSeen") || 0),
   };
 
+  const DESK_ORDER = [
+    { id: "desk2", label: "Desk 10k" },
+    { id: "desk3", label: "Desk 20k" },
+    { id: "desk1", label: "Desk 40k" },
+  ];
+
   function deskSlot() {
-    return localStorage.getItem("deskSlot") === "desk2" ? "desk2" : "desk1";
+    const slot = localStorage.getItem("deskSlot");
+    if (slot === "desk2" || slot === "desk3") return slot;
+    return "desk1";
+  }
+
+  function deskLabel() {
+    const slot = deskSlot();
+    const found = DESK_ORDER.find((desk) => desk.id === slot);
+    return found ? found.label : "Desk 40k";
   }
 
   function deskPrefix() {
-    return deskSlot() === "desk2" ? "desk2/" : "";
+    const slot = deskSlot();
+    return slot === "desk1" ? "" : slot + "/";
+  }
+
+  function seenKey(slot) {
+    if (slot === "desk2") return "deskSeen2";
+    if (slot === "desk3") return "deskSeen3";
+    return "deskSeen";
   }
 
   function capturePath() {
@@ -147,7 +168,7 @@
     const rows = (state.activity && state.activity.rows) || [];
     const max = rows.reduce((best, row) => Math.max(best, Number(row.id) || 0), state.seen);
     state.seen = max;
-    localStorage.setItem(deskSlot() === "desk2" ? "deskSeen2" : "deskSeen", String(max));
+    localStorage.setItem(seenKey(deskSlot()), String(max));
   }
 
   function home() {
@@ -159,8 +180,7 @@
       <div class="desks ${deskSlot()}" role="tablist" aria-label="Desk">
         <div class="desks-track">
           <span class="desks-thumb" aria-hidden="true"></span>
-          <button type="button" role="tab" data-desk="desk1" aria-selected="${deskSlot() === "desk1"}" class="${deskSlot() === "desk1" ? "on" : ""}">Desk 1</button>
-          <button type="button" role="tab" data-desk="desk2" aria-selected="${deskSlot() === "desk2"}" class="${deskSlot() === "desk2" ? "on" : ""}">Desk 2</button>
+          ${DESK_ORDER.map((desk) => `<button type="button" role="tab" data-desk="${desk.id}" aria-selected="${deskSlot() === desk.id}" class="${deskSlot() === desk.id ? "on" : ""}">${desk.label}</button>`).join("")}
         </div>
       </div>
       <div class="nav">
@@ -169,7 +189,7 @@
         <input class="search" id="search" placeholder="Search" value="${esc(state.query)}">
         <button class="bell" id="bell" aria-label="Activity">${unread() ? '<i class="dot"></i>' : ""}</button>
       </div>
-      ${data.paper ? '<div class="paper">PAPER</div>' : ""}
+      ${data.paper ? `<div class="paper">PAPER · ${esc(deskLabel())}</div>` : `<div class="paper">${esc(deskLabel())}</div>`}
       <div class="balance">
         <div class="odo">${odo(data.balance)}</div>
         <div class="sub">
@@ -399,8 +419,9 @@
     }
     document.querySelectorAll("[data-desk]").forEach((button) => {
       button.addEventListener("click", () => {
-        localStorage.setItem("deskSlot", button.dataset.desk === "desk2" ? "desk2" : "desk1");
-        state.seen = Number(localStorage.getItem(deskSlot() === "desk2" ? "deskSeen2" : "deskSeen") || 0);
+        const chosen = button.dataset.desk;
+        localStorage.setItem("deskSlot", chosen === "desk2" || chosen === "desk3" ? chosen : "desk1");
+        state.seen = Number(localStorage.getItem(seenKey(deskSlot())) || 0);
         state.data = null;
         state.chart = null;
         state.activity = null;

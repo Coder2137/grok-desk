@@ -8,7 +8,7 @@ from pathlib import Path
 
 from config import DeskSettings, iso, utc_now
 from db import Database
-from instance import apply_instance, resolve_instance, setting_overrides
+from instance import INSTANCES, apply_instance, display_name, resolve_instance, setting_overrides
 from links import coin_url
 from telegram import _equity
 
@@ -44,8 +44,8 @@ a {{ color: #64d2ff; }}
 </head>
 <body>
 <main>
-<h1>Morning</h1>
-<p>{_esc(mode)} · ${equity:.2f} · { _esc(iso(utc_now())) }</p>
+<h1>{_esc(display_name())}</h1>
+<p>Morning · {_esc(mode)} · ${equity:.2f} · { _esc(iso(utc_now())) }</p>
 <ul>
 {''.join(rows) or '<li>No trades</li>'}
 </ul>
@@ -72,7 +72,7 @@ def main() -> None:
     apply_instance(name)
     db = Database(os.environ.get("DESK_DB", "var/desk.db"))
     settings = DeskSettings(db, overrides=setting_overrides(name))
-    default_out = "var/report/morning.html" if name == "desk1" else "var/desk2/morning.html"
+    default_out = INSTANCES.get(name, INSTANCES["desk1"])["report"]
     out = Path(os.environ.get("REPORT_PATH", default_out))
     path = write_report(db, settings, out)
     print(path.name)

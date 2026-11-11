@@ -9,7 +9,15 @@ from api import Writer
 from bus import Bus
 from config import DeskSettings, defaults
 from db import Database
-from instance import DESK2_LIQUIDITY, apply_instance, resolve_instance, setting_overrides
+from instance import (
+    DESK2_LIQUIDITY,
+    DESK3_LIQUIDITY,
+    apply_instance,
+    display_name,
+    holds_socket,
+    resolve_instance,
+    setting_overrides,
+)
 from livecrypto import decrypt_envelope, envelope_bytes, encrypt_envelope, is_live_path
 from logutil import file_logger, log
 from publish_live import load_live_files
@@ -30,6 +38,64 @@ def _metrics(liquidity):
         "name": "Coin",
         "symbol": "COIN",
     }
+
+
+def test_desk3_is_its_own_20k_paper_desk(tmp_path):
+    env = {"DESK_DB": "var/desk.db", "JSON_ROOT": "var/json", "DESK_TELEGRAM": "1"}
+    apply_instance("desk3", env)
+    assert env["DESK_DB"] == "var/desk3.db"
+    assert env["JSON_ROOT"] == "var/desk3/json"
+    assert env["DESK_LIVE_PREFIX"] == "desk3"
+    assert env["LOG_DIR"] == "logs/desk3"
+    assert env["DESK_FEED_OFFSET"] == "var/desk3/feed.offset"
+    assert env["DESK_TELEGRAM"] == "0"
+    assert env["LOCAL_PORT"] == "8767"
+    assert display_name("desk1") == "Desk 40k"
+    assert display_name("desk2") == "Desk 10k"
+    assert display_name("desk3") == "Desk 20k"
+    assert resolve_instance(["main.py", "--instance", "desk3"], {}) == "desk3"
+    assert holds_socket("desk1") is True
+    assert holds_socket("desk2") is False
+    assert holds_socket("desk3") is False
+    db = Database(tmp_path / "desk3.db")
+    try:
+        settings = DeskSettings(db, overrides=setting_overrides("desk3"))
+        assert settings.get("scanner.min_liquidity_usd") == DESK3_LIQUIDITY
+        assert settings.get("desk.stack") == 200
+        assert settings.get("desk.mode") == "PAPER"
+        assert settings.set("desk.mode", "LIVE", "test") == (False, "need 1 full PAPER night")
+        assert judge(_metrics(15000), settings.all(), [])[0] == "kill"
+        assert judge(_metrics(25000), settings.all(), []) == ("pass", None)
+        assert judge(_metrics(25000), defaults(), [])[0] == "kill"
+    finally:
+        db.close()
+    assert is_live_path("desk3/state.json")
+    assert is_live_path("desk3/coin/Mint333.json")
+    assert not is_live_path("desk3/.plain-hashes.json")
+    root = tmp_path / "live"
+    (root / "desk3").mkdir(parents=True)
+    name = "desk3/state.json"
+    (root / name).write_bytes(
+        envelope_bytes(encrypt_envelope(b'{"balance":3}', FIXTURE_DATA_PATH, name, nonce=bytes(range(12))))
+    )
+    for core in ("state.json", "chart.json", "activity.json"):
+        (root / core).write_bytes(
+            envelope_bytes(encrypt_envelope(b"{}", FIXTURE_DATA_PATH, core, nonce=bytes(range(12))))
+        )
+    found = load_live_files(root)
+    assert "desk3/state.json" in found
+    assert "state.json" in found
+    script = Path("run-desk3.ps1").read_text(encoding="utf-8")
+    assert '$env:DESK_INSTANCE = "desk3"' in script
+    assert '$env:DESK_TELEGRAM = "0"' in script
+    assert "FORCE_LIVE is refused." in script
+    assert ".desk-secrets" in script
+    cmd = Path("GrokDesk3.cmd").read_text(encoding="utf-8")
+    assert r"%USERPROFILE%\grok-desk\run-desk3.ps1" in cmd
+    assert "DESK_HOME" in cmd
+    assert "kwiat" not in cmd
+    page = Path("web/app.js").read_text(encoding="utf-8")
+    assert page.index("Desk 10k") < page.index("Desk 20k") < page.index("Desk 40k")
 
 
 def test_desk1_liquidity_default_stays_40k():

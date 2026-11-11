@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from config import GROUPS, SETTINGS, iso, parse_iso, utc_now
 from fields import dex_fields, pumpswap_pair
+from instance import display_name
 from links import coin_url, profile_url
 from livecrypto import encrypt_envelope, envelope_bytes, is_live_path
 from logutil import file_logger, log
@@ -214,6 +215,7 @@ def build_state(db, settings) -> dict:
     handle = settings.get("desk.fomo_handle") or ""
     return {
         "ts": iso(now),
+        "deskName": display_name(),
         "mode": settings.get("desk.mode"),
         "paper": settings.get("desk.mode") == "PAPER",
         "balance": round(equity, 2),
