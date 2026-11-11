@@ -154,6 +154,29 @@ canvas.chart { width: 100%; height: 196px; display: block; }
 .ranges button.on { color: var(--text); }
 h2 { font-size: 13px; color: var(--muted); font-weight: 600; margin: 16px 16px 8px; display: flex; justify-content: space-between; }
 h2 button { color: var(--blue); }
+.desks + .screen-head { padding-top: 8px; }
+.more {
+  display: block;
+  width: calc(100% - 32px);
+  margin: 4px 16px 16px;
+  color: var(--blue);
+  font-weight: 650;
+  text-align: center;
+  padding: 12px 0;
+}
+.card .more { width: 100%; margin: 8px 0 0; }
+details.fold > summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 650;
+  cursor: pointer;
+  list-style: none;
+}
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::after { content: "▸"; color: var(--muted); }
+details.fold[open] > summary::after { content: "▾"; }
+details.fold[open] > summary { margin-bottom: 8px; }
 
 .carousel { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x mandatory; padding: 0 16px 8px; }
 .carousel .card { scroll-snap-align: start; min-width: 78%; margin: 0; }
