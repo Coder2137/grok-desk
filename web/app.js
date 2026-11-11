@@ -16,6 +16,8 @@
     retry: 15,
     timer: null,
     seen: Number(localStorage.getItem(localStorage.getItem("deskSlot") === "desk2" ? "deskSeen2" : localStorage.getItem("deskSlot") === "desk3" ? "deskSeen3" : "deskSeen") || 0),
+    more: { activity: 8, scanner: 4, analyst: 4, coins: 0, search: 8 },
+    openGroups: {},
   };
 
   const DESK_ORDER = [
@@ -156,7 +158,27 @@
     if (!q) return [];
     return coins.filter((coin) => {
       return [coin.name, coin.symbol, coin.mint].join(" ").toLowerCase().includes(q);
-    }).slice(0, 8);
+    });
+  }
+
+  function resetLists() {
+    state.more = { activity: 8, scanner: 4, analyst: 4, coins: 0, search: 8 };
+    state.openGroups = {};
+  }
+
+  function moreButton(key, left) {
+    if (left <= 0) return "";
+    return `<button type="button" class="more" data-more="${key}">Show more · ${left} left</button>`;
+  }
+
+  function desksHtml() {
+    return `
+      <div class="desks ${deskSlot()}" role="tablist" aria-label="Desk">
+        <div class="desks-track">
+          <span class="desks-thumb" aria-hidden="true"></span>
+          ${DESK_ORDER.map((desk) => `<button type="button" role="tab" data-desk="${desk.id}" aria-selected="${deskSlot() === desk.id}" class="${deskSlot() === desk.id ? "on" : ""}">${desk.label}</button>`).join("")}
+        </div>
+      </div>`;
   }
 
   function unread() {
@@ -175,14 +197,10 @@
     if (!state.data) return loading();
     const data = state.data;
     const change = Number(data.dayChangePct || 0);
-    const hits = filteredCoins();
+    const hits = filteredCoins().slice(0, state.more.search);
+    const hitLeft = filteredCoins().length - hits.length;
     return `
-      <div class="desks ${deskSlot()}" role="tablist" aria-label="Desk">
-        <div class="desks-track">
-          <span class="desks-thumb" aria-hidden="true"></span>
-          ${DESK_ORDER.map((desk) => `<button type="button" role="tab" data-desk="${desk.id}" aria-selected="${deskSlot() === desk.id}" class="${deskSlot() === desk.id ? "on" : ""}">${desk.label}</button>`).join("")}
-        </div>
-      </div>
+      ${desksHtml()}
       <div class="nav">
         <button class="avatar" id="go-account" aria-label="Account">•</button>
         <button class="brand" id="go-agents">Grok Bot ›</button>
@@ -202,14 +220,30 @@
       <div class="ranges">
         ${["LIVE", "1H", "4H", "1D", "1W", "ALL"].map((item) => `<button type="button" data-range="${item}" class="${state.range === item ? "on" : ""}">${item}</button>`).join("")}
       </div>
-      ${hits.length ? `<div class="hits">${hits.map((coin) => `<button type="button" data-coin="${esc(coin.mint)}">${esc(coin.name || coin.symbol || coin.mint)}</button>`).join("")}</div>` : ""}
+      ${hits.length ? `<div class="hits">${hits.map((coin) => `<button type="button" data-coin="${esc(coin.mint)}">${esc(coin.name || coin.symbol || coin.mint)}</button>`).join("")}</div>${moreButton("search", hitLeft)}` : ""}
       <h2>Agents · 5 running</h2>
       <div class="carousel">
         ${agentCard("scanner", true)}${agentCard("auditor", true)}${agentCard("analyst", true)}${agentCard("executor", true)}${agentCard("risk", true)}
       </div>
       <h2>Activity <button type="button" id="see-all">See all</button></h2>
       <div class="activity card">${activityRows((data.activity || []).slice(0, 5))}</div>
+      ${coinsBlock()}
     `;
+  }
+
+  function coinsBlock() {
+    const coins = (state.data && state.data.coins) || [];
+    if (!coins.length) return "";
+    const limit = state.more.coins;
+    if (!limit) {
+      return `<h2>Coins <button type="button" data-more="coins">Show ${coins.length}</button></h2>`;
+    }
+    const visible = coins.slice(0, limit);
+    const rows = visible.map((coin) => `
+      <button class="row" type="button" data-coin="${esc(coin.mint)}">
+        <span class="stack"><b>${esc(coin.name || coin.symbol || coin.mint)}</b><span class="muted">${esc(coin.symbol || "")}</span></span>
+      </button>`).join("");
+    return `<h2>Coins</h2><div class="card list">${rows}</div>${moreButton("coins", coins.length - visible.length)}`;
   }
 
   function loading() {
@@ -268,22 +302,26 @@
   function agents() {
     if (!state.data) return loading();
     const order = ["scanner", "auditor", "analyst", "executor", "risk"];
-    return `<div class="screen-head"><h1>Agents</h1></div>` + order.map((name) => {
+    return desksHtml() + `<div class="screen-head"><h1>Agents</h1></div>` + order.map((name) => {
       const card = state.data.agents[name];
       const locked = name === "risk" && card.locked;
-      const decisions = (name === "scanner" ? card.rows : name === "analyst" ? card.rows : []).slice(0, 20);
+      const all = name === "scanner" || name === "analyst" ? card.rows || [] : [];
+      const limit = name === "scanner" || name === "analyst" ? state.more[name] : all.length;
+      const decisions = all.slice(0, limit);
       return `<article class="card">
         <header><span class="agent-name ${name}">${name[0].toUpperCase() + name.slice(1)}</span><i class="status ${card.running ? "on" : ""}"></i></header>
         <p>${card.count || 0} today ${card.paused ? "· paused" : ""} ${locked ? '<span class="lock">· locked</span>' : ""}</p>
         <button type="button" disabled>${card.paused ? "Resume in Telegram" : "Pause in Telegram"}</button>
         ${decisions.map((row) => `<div class="feed">${esc(row.name || row.mint)} ${esc(row.reason || row.score || "")}</div>`).join("")}
+        ${moreButton(name, all.length - decisions.length)}
       </article>`;
     }).join("") + `<p class="note">Settings change in Telegram.</p>`;
   }
 
   function activityScreen() {
     const rows = (state.activity && state.activity.rows) || (state.data && state.data.activityMore) || [];
-    return `<div class="screen-head"><h1>Activity</h1></div><div class="card activity">${activityRows(rows)}</div>`;
+    const visible = rows.slice(0, state.more.activity);
+    return `${desksHtml()}<div class="screen-head"><h1>Activity</h1></div><div class="card activity">${activityRows(visible)}</div>${moreButton("activity", rows.length - visible.length)}`;
   }
 
   function account() {
@@ -296,10 +334,12 @@
         }
         return `<label class="field">${esc(row.key)} <b>${esc(row.value)}</b></label>`;
       }).join("");
-      return `<section class="card"><h3>${esc(group)}</h3>${fields}</section>`;
+      const open = state.openGroups[group] ? "open" : "";
+      return `<details class="card fold" data-group="${esc(group)}" ${open}><summary>${esc(group)}</summary>${fields}</details>`;
     }).join("");
     const profile = data.profileUrl ? `<a class="btn" href="${esc(data.profileUrl)}">Your FOMO profile</a>` : `<p class="note">Your FOMO profile appears after the handle is set in Telegram.</p>`;
     return `
+      ${desksHtml()}
       <div class="screen-head"><h1>Account</h1></div>
       <div class="paper">${esc(data.mode)}</div>
       <p class="note">Stack ${money(data.stack)}. LIVE asks you to type LIVE in Telegram.</p>
@@ -329,6 +369,7 @@
     const enabled = state.data && state.data.auditorEnabled;
     const link = coin.link ? `<a class="btn" href="${esc(coin.link)}">Open on FOMO</a>` : "";
     return `
+      ${desksHtml()}
       <div class="screen-head"><button class="back" id="back">Back</button><h1>${esc(coin.name || "Auditor")}</h1></div>
       <div class="discs"><i class="beam"></i>${discs}</div>
       <p class="note">${copy}</p>
@@ -352,6 +393,7 @@
     const buy = link ? `<a class="btn" href="${esc(link)}">Buy on FOMO</a>` : "";
     const sell = link && position ? `<a class="btn sell" href="${esc(link)}">Sell on FOMO</a>` : "";
     return `
+      ${desksHtml()}
       <div class="screen-head"><button class="back" id="back">Back</button><h1>${esc(coin.name || coin.mint)}</h1></div>
       ${coin.mode === "PAPER" ? '<div class="paper">PAPER</div>' : ""}
       <p class="note">${esc(coin.symbol || "")} · Solana · ${esc(coin.age || "")} ${coin.shield ? "· " + esc(coin.shield) : ""}</p>
@@ -408,6 +450,7 @@
     const search = document.getElementById("search");
     if (search) {
       search.addEventListener("input", () => {
+        if (search.value !== state.query) state.more.search = 8;
         state.query = search.value;
         render();
         const again = document.getElementById("search");
@@ -422,6 +465,7 @@
         const chosen = button.dataset.desk;
         localStorage.setItem("deskSlot", chosen === "desk2" || chosen === "desk3" ? chosen : "desk1");
         state.seen = Number(localStorage.getItem(seenKey(deskSlot())) || 0);
+        resetLists();
         state.data = null;
         state.chart = null;
         state.activity = null;
@@ -454,6 +498,18 @@
           const mint = state.data && state.data.agents.auditor.current;
           setScreen("auditor", mint || "");
         } else setScreen("agents");
+      });
+    });
+    document.querySelectorAll("[data-more]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const key = button.dataset.more;
+        state.more[key] = (state.more[key] || 0) + 8;
+        render();
+      });
+    });
+    document.querySelectorAll("details.fold").forEach((el) => {
+      el.addEventListener("toggle", () => {
+        state.openGroups[el.dataset.group] = el.open;
       });
     });
     const test = document.getElementById("test-push");

@@ -1,0 +1,164 @@
+/* Theme C — bold neon memecoin.
+   Load after app.css. Leave this file unlinked until it is the chosen look. */
+
+:root {
+  color-scheme: dark;
+  --bg: #07000f;
+  --card: #120018;
+  --text: #fff6ff;
+  --muted: #d29bff;
+  --line: #ff2bd6;
+  --green: #d6ff3f;
+  --red: #ff2b6a;
+  --blue: #39f3ff;
+  --cyan: #39f3ff;
+  --orange: #ffb020;
+  --purple: #ff2bd6;
+}
+
+html, body { background: #07000f; color: var(--text); }
+body { font: 16px/1.25 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+#app {
+  background:
+    radial-gradient(80% 30% at 100% 0%, rgba(255, 43, 214, 0.28), transparent 50%),
+    radial-gradient(70% 30% at 0% 20%, rgba(214, 255, 63, 0.12), transparent 46%),
+    var(--bg);
+}
+
+.desks { background: rgba(7, 0, 15, 0.9); }
+.desks-track {
+  height: 52px;
+  border-radius: 6px;
+  background: #000;
+  border: 2px solid #ff2bd6;
+  padding: 3px;
+}
+.desks-thumb {
+  border-radius: 4px;
+  background: linear-gradient(90deg, #ff2bd6, #d6ff3f);
+  box-shadow: 0 0 16px rgba(255, 43, 214, 0.7);
+}
+.desks.desk2 .desks-thumb, .desks.desk3 .desks-thumb, .desks.desk1 .desks-thumb { border-radius: 4px; }
+.desks button {
+  color: #ffd6f6;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+.desks button.on { color: #140018; }
+
+.avatar, .bell {
+  border-radius: 6px;
+  background: #000;
+  border: 2px solid #39f3ff;
+  color: #39f3ff;
+}
+.brand { font-weight: 900; letter-spacing: -0.04em; text-transform: uppercase; }
+.search {
+  background: #000;
+  border: 2px solid #d6ff3f;
+  border-radius: 6px;
+  color: #d6ff3f;
+}
+.search::placeholder { color: #6d8a22; }
+.paper {
+  color: #d6ff3f;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+  text-shadow: 0 0 12px rgba(214, 255, 63, 0.7);
+}
+.odo, .big {
+  font-weight: 900;
+  letter-spacing: -0.05em;
+  color: #fff;
+  text-shadow: 0 0 18px #ff2bd6, 0 0 2px #fff;
+}
+.odo span { min-width: 0; }
+.pill {
+  background: #d6ff3f;
+  color: #140018;
+  border-radius: 4px;
+  font-weight: 900;
+}
+.up { color: #d6ff3f; }
+.down { color: #ff2b6a; }
+.note { color: var(--muted); }
+
+canvas.chart { height: 150px; }
+.chart-wrap {
+  border: 2px solid #39f3ff;
+  border-radius: 6px;
+  box-shadow: 0 0 18px rgba(57, 243, 255, 0.25);
+  padding: 6px;
+}
+.ranges button, .mini {
+  background: #000;
+  color: #39f3ff;
+  border: 2px solid #39f3ff;
+  border-radius: 4px;
+  font-weight: 800;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+.ranges button.on { background: #39f3ff; color: #041014; }
+
+h2 {
+  color: #ff2bd6;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+h2 button, .more, .back { color: #d6ff3f; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em; }
+
+.card, .hits, .grid div, .toggle {
+  background: #120018;
+  border: 2px solid #ff2bd6;
+  border-radius: 6px;
+  box-shadow: 4px 4px 0 #d6ff3f;
+}
+.carousel .card { min-width: 84%; }
+.agent-name { font-weight: 900; text-transform: uppercase; letter-spacing: 0.04em; }
+.scanner { color: #39f3ff; }
+.auditor { color: #d6ff3f; }
+.analyst { color: #ff2bd6; }
+.executor { color: #d6ff3f; }
+.risk { color: #ffb020; }
+.activity .row, .list .row {
+  margin: 0;
+  padding: 8px 0;
+  border-top: 2px solid rgba(255, 43, 214, 0.45);
+}
+.feed { font-weight: 700; }
+.kill b { color: #ff2b6a; }
+.strip { background: #000; border: 1px solid #39f3ff; color: #39f3ff; border-radius: 4px; }
+.ring { background: conic-gradient(#d6ff3f calc(var(--p) * 1%), #2a0038 0); }
+.ring span { background: #120018; color: #d6ff3f; }
+.tag { border-radius: 4px; font-weight: 800; }
+.tag.stop { background: #ff2b6a; color: #fff; }
+.tag.trail { background: #d6ff3f; color: #140018; }
+.status.on { background: #d6ff3f; box-shadow: 0 0 8px #d6ff3f; }
+
+#tabs {
+  background: #000;
+  border-top: 3px solid #ff2bd6;
+  border-radius: 0;
+}
+#tabs button { color: #d29bff; font-weight: 900; text-transform: uppercase; font-size: 11px; letter-spacing: 0.08em; }
+#tabs button.on { color: #d6ff3f; }
+
+.btn { border-radius: 4px; background: #d6ff3f; color: #140018; font-weight: 900; text-transform: uppercase; box-shadow: 3px 3px 0 #ff2bd6; }
+.btn.sell { background: #ff2b6a; color: white; box-shadow: 3px 3px 0 #39f3ff; }
+.disc { border-radius: 4px; background: #2a0038; }
+.disc.ok { background: #d6ff3f; }
+.disc.bad { background: #ff2b6a; }
+.switch { border-radius: 4px; background: #2a0038; border: 2px solid #ff2bd6; }
+.switch.on { background: #d6ff3f; }
+.switch i { border-radius: 2px; }
+.hits { box-shadow: 4px 4px 0 #39f3ff; }
+.hits button { color: #fff6ff; border-top: 2px solid rgba(255, 43, 214, 0.45); font-weight: 800; }
+details.fold > summary { text-transform: uppercase; letter-spacing: 0.08em; font-weight: 900; }
+details.fold > summary::after { color: #d6ff3f; }
+.field input[type="range"] { accent-color: #d6ff3f; }
+.error { background: #2a0010; color: #ff2b6a; border-bottom: 2px solid #ff2b6a; }
