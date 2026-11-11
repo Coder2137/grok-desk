@@ -8,10 +8,11 @@ from agents.auditor import Auditor, audit_from_facts
 from bus import Bus
 from config import DeskSettings, defaults, utc_now
 from db import Database
-from fields import insider_bundle_size, program_account_rows
+from fields import buyers_from_transaction, early_slot_bundle_size, insider_bundle_size, program_account_rows
 from sources import TOKEN_2022, TOKEN_PROGRAM
 
 MINT = "FixtureBundleMint11111111111111111111111"
+POOL = "A" * 32
 DEV = "FixtureBundleDev111111111111111111111111"
 
 
@@ -78,6 +79,15 @@ def test_missing_graph_still_uses_the_report_size():
     assert error == "rugcheck unavailable"
     size, error = insider_bundle_size({"nodes": [], "links": []}, None)
     assert size == 0
+    assert error is None
+    size, error = insider_bundle_size([], {"insiderNetworks": None, "graphInsidersDetected": 0})
+    assert size is None
+    assert error == "empty network"
+    size, error = insider_bundle_size([], {"insiderNetworks": [], "graphInsidersDetected": 0})
+    assert size is None
+    assert error == "empty network"
+    size, error = insider_bundle_size([], {"insiderNetworks": None, "graphInsidersDetected": 6})
+    assert size == 6
     assert error is None
 
 
@@ -254,7 +264,7 @@ def test_largest_accounts_supply_delegates_when_program_accounts_429(tmp_path, m
         return {
             "creator": DEV,
             "creatorBalance": 1000,
-            "insiderNetworks": [],
+            "insiderNetworks": [{"size": 1, "activeAccounts": 1}],
             "topHolders": [{"owner": "A", "pct": 4}],
             "markets": [{"pubkey": "Pool", "lp": {"lpLockedPct": 100}}],
         }
@@ -285,6 +295,160 @@ def test_largest_accounts_supply_delegates_when_program_accounts_429(tmp_path, m
     layer8 = next(layer for layer in result["layers"] if layer["n"] == 8)
     assert layer8["pass"] is True
     assert layer8["value"] == "None"
+    db.close()
+
+
+def _buy_tx(owner, pool=POOL, funder=None):
+    instructions = []
+    if funder:
+        instructions.append(
+            {"program": "system", "parsed": {"type": "transfer", "info": {"source": funder, "destination": owner, "lamports": 1}}}
+        )
+    return {
+        "meta": {
+            "preTokenBalances": [
+                {"mint": MINT, "owner": pool, "uiTokenAmount": {"uiAmount": 100}},
+                {"mint": MINT, "owner": owner, "uiTokenAmount": {"uiAmount": 0}},
+            ],
+            "postTokenBalances": [
+                {"mint": MINT, "owner": pool, "uiTokenAmount": {"uiAmount": 90}},
+                {"mint": MINT, "owner": owner, "uiTokenAmount": {"uiAmount": 10}},
+            ],
+        },
+        "transaction": {"message": {"instructions": instructions}},
+    }
+
+
+def test_same_slot_buyers_are_a_bundle_and_a_missing_tx_is_not():
+    assert buyers_from_transaction(_buy_tx("WalletA", POOL), MINT, POOL) == ["WalletA"]
+    size, error = early_slot_bundle_size(
+        [
+            {"slot": 5, "buyers": ["WalletA", "WalletB"], "funder": "Funder"},
+            {"slot": 5, "buyers": ["WalletC"], "funder": "Funder"},
+            {"slot": 6, "buyers": []},
+        ]
+    )
+    assert error is None
+    assert size == 3
+    size, error = early_slot_bundle_size([{"slot": 1, "missing": True, "error": "rpc 429"}])
+    assert size is None
+    assert error == "rpc 429"
+    size, error = early_slot_bundle_size([{"slot": 1, "buyers": []}])
+    assert size is None
+    assert error == "early buys missing"
+
+
+def _gather_client(handler):
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json=None, timeout=None):
+            return handler((json or {}).get("method"), (json or {}).get("params") or [])
+
+    return Client
+
+
+def _arm_bundle_desk(tmp_path, monkeypatch, client):
+    db = Database(tmp_path / "desk.db")
+    settings = DeskSettings(db)
+    settings.set("auditor.retries", "1", "test")
+    db.upsert_coin(
+        mint=MINT,
+        creator=DEV,
+        creator_balance_at_migration=1000,
+        migrated_at="2026-11-10T00:00:00+00:00",
+        pool=POOL,
+    )
+
+    async def report(_mint, _client):
+        return {
+            "creator": DEV,
+            "creatorBalance": 1000,
+            "insiderNetworks": None,
+            "graphInsidersDetected": 0,
+            "topHolders": [{"owner": "A", "pct": 4}],
+            "markets": [{"pubkey": POOL, "lp": {"lpLockedPct": 100}}],
+        }
+
+    async def graph(_mint, _client):
+        return []
+
+    async def fake_rpc(_url, method, _params, _client):
+        if method == "getAccountInfo":
+            return {"result": {"value": {"data": {"parsed": {"info": {
+                "mintAuthority": None, "freezeAuthority": None, "supply": "1000000", "decimals": 0,
+            }}}}}}
+        return None
+
+    monkeypatch.setattr("agents.auditor.httpx.AsyncClient", client)
+    monkeypatch.setattr("agents.auditor.rug_report", report)
+    monkeypatch.setattr("agents.auditor.rug_graph", graph)
+    monkeypatch.setattr("agents.auditor.rpc", fake_rpc)
+    return db, settings, Bus()
+
+
+def test_empty_network_uses_early_buys_and_then_checks_delegations(tmp_path, monkeypatch):
+    def handler(method, params):
+        if method == "getTokenAccountsByOwner":
+            return httpx.Response(200, json={"result": {"value": [{"account": {"data": {"parsed": {"info": {
+                "mint": MINT, "owner": DEV, "tokenAmount": {"uiAmount": 1000},
+            }}}}}]}})
+        if method == "getProgramAccounts":
+            return httpx.Response(200, json={"result": [_account("Holder")]})
+        if method == "getSignaturesForAddress":
+            return httpx.Response(200, json={"result": [
+                {"signature": "sigA", "slot": 9, "err": None},
+                {"signature": "sigB", "slot": 9, "err": None},
+            ]})
+        if method == "getTransaction":
+            owner = "WalletA" if params[0] == "sigA" else "WalletB"
+            return httpx.Response(200, json={"result": _buy_tx(owner, POOL)})
+        return httpx.Response(200, json={"result": {"value": []}})
+
+    db, settings, bus = _arm_bundle_desk(tmp_path, monkeypatch, _gather_client(handler))
+    facts = asyncio.run(Auditor(db, settings, bus).gather({"mint": MINT, "pool": POOL, "liquidityUsd": 80_000}))
+    assert facts["bundle_size"] == 2
+    assert facts["bundle_error"] is None
+    result = audit_from_facts(facts)
+    layer7 = next(layer for layer in result["layers"] if layer["n"] == 7)
+    layer8 = next(layer for layer in result["layers"] if layer["n"] == 8)
+    assert layer7["pass"] is True
+    assert layer7["value"] == "2"
+    assert layer8["value"] != "not checked"
+    assert layer8["pass"] is True
+    assert result["passed"] is True
+    db.close()
+
+
+def test_empty_network_stays_closed_when_the_early_read_fails(tmp_path, monkeypatch):
+    def handler(method, params):
+        if method == "getTokenAccountsByOwner":
+            return httpx.Response(200, json={"result": {"value": [{"account": {"data": {"parsed": {"info": {
+                "mint": MINT, "owner": DEV, "tokenAmount": {"uiAmount": 1000},
+            }}}}}]}})
+        if method == "getProgramAccounts":
+            return httpx.Response(200, json={"result": []})
+        if method == "getSignaturesForAddress":
+            return httpx.Response(429, json={"message": "Too many requests"})
+        return httpx.Response(200, json={"result": {"value": []}})
+
+    db, settings, bus = _arm_bundle_desk(tmp_path, monkeypatch, _gather_client(handler))
+    facts = asyncio.run(Auditor(db, settings, bus).gather({"mint": MINT, "pool": POOL, "liquidityUsd": 80_000}))
+    assert facts["bundle_size"] is None
+    assert facts["bundle_error"] == "rpc 429"
+    result = audit_from_facts(facts)
+    assert result["passed"] is False
+    assert result["reason"] == "no data: bundles (rpc 429)"
+    layer8 = next(layer for layer in result["layers"] if layer["n"] == 8)
+    assert layer8["value"] == "not checked"
+    assert layer8["pass"] is None
     db.close()
 
 

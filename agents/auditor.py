@@ -7,6 +7,9 @@ import httpx
 from config import iso, parse_iso, utc_now
 from fields import (
     MISSING,
+    buyers_from_transaction,
+    early_slot_bundle_size,
+    funder_from_transaction,
     graph_nodes_links,
     insider_bundle_size,
     program_account_rows,
@@ -92,6 +95,15 @@ def biggest_bundle(nodes, links) -> int:
         root = find(item)
         sizes[root] = sizes.get(root, 0) + 1
     return max(sizes.values())
+
+
+def _solana_address(value) -> str | None:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    if not isinstance(value, str) or not (32 <= len(value) <= 44):
+        return None
+    if any(ch not in alphabet for ch in value):
+        return None
+    return value
 
 
 def short_addr(value: str) -> str:
@@ -447,6 +459,13 @@ class Auditor:
                     top10_error = None
             accounts, delegations_error = await self._delegations(rpc_url, mint, client, retries)
             delegations_down = False
+            bundle_size, bundle_error = insider_bundle_size(graph, report if isinstance(report, dict) else None)
+            if bundle_size is None:
+                measured, measured_error = await self._early_bundle(client, rpc_url, pool, mint, retries)
+                if measured is not None:
+                    bundle_size, bundle_error = measured, None
+                else:
+                    bundle_error = measured_error or bundle_error or "missing"
         mint_account = rpc_mint_account(mint_resp) if mint_resp else {
             "mintAuthority": MISSING,
             "freezeAuthority": MISSING,
@@ -454,12 +473,11 @@ class Auditor:
             "decimals": None,
         }
         nodes, links, links_missing, empty_network = graph_nodes_links(graph)
-        bundle_size, bundle_error = insider_bundle_size(graph, report if isinstance(report, dict) else None)
-        if bundle_size is None and not bundle_error:
-            bundle_error = "missing"
         if bundle_size is not None:
             links_missing = False
             empty_network = False
+        elif not bundle_error:
+            bundle_error = "missing"
         pool_for_lp = message.get("pool") or (coin["pool"] if coin else None)
         lp = rug_lp(report or {}, pool_for_lp)
         if report is None:
@@ -654,6 +672,75 @@ class Auditor:
             fields["address"] = address
             out.append(fields)
         return out, None
+
+    async def _signature_pages(self, client, rpc_url, address, retries):
+        collected = []
+        before = None
+        for _page in range(8):
+            options = {"limit": 1000}
+            if before:
+                options["before"] = before
+            body, error = await self._rpc_call(
+                client, rpc_url, "getSignaturesForAddress", [address, options], retries
+            )
+            if body is None:
+                return None, error or "rpc unavailable", False
+            result = body.get("result")
+            if not isinstance(result, list):
+                return None, "signatures missing", False
+            collected.extend(item for item in result if isinstance(item, dict))
+            if len(result) < 1000:
+                return collected, None, False
+            last = result[-1]
+            before = last.get("signature") if isinstance(last, dict) else None
+            if not before:
+                return None, "signatures missing", False
+        return collected, None, True
+
+    async def _early_bundle(self, client, rpc_url, pool, mint, retries):
+        """Same-slot buyers, and buyers funded inside the same transaction.
+
+        Used only when RugCheck has not built an insider network. A partial
+        or unread window is not a measurement.
+        """
+        address = _solana_address(pool) or _solana_address(mint)
+        if not address:
+            return None, "pool missing"
+        signatures, error, truncated = await self._signature_pages(client, rpc_url, address, retries)
+        if signatures is None:
+            return None, error or "rpc unavailable"
+        if not signatures:
+            return None, "no signatures"
+        if truncated:
+            return None, "early window incomplete"
+        usable = [
+            row for row in signatures
+            if isinstance(row, dict) and row.get("signature") and not row.get("err")
+        ]
+        if not usable:
+            return None, "early buys missing"
+        usable.sort(key=lambda row: (row.get("slot") or 0, row.get("transactionIndex") or 0))
+        events = []
+        for row in usable[:40]:
+            body, tx_error = await self._rpc_call(
+                client,
+                rpc_url,
+                "getTransaction",
+                [row["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}],
+                retries,
+            )
+            result = body.get("result") if isinstance(body, dict) else None
+            buyers = buyers_from_transaction(result, mint, address) if isinstance(result, dict) else None
+            if buyers is None:
+                return None, tx_error or "tx missing"
+            events.append(
+                {
+                    "slot": row.get("slot"),
+                    "buyers": buyers,
+                    "funder": funder_from_transaction(result, buyers),
+                }
+            )
+        return early_slot_bundle_size(events)
 
     async def _delegations(self, rpc_url, mint, client, retries):
         """Delegates on token accounts. Both programs are read.

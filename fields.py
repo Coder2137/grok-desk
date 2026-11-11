@@ -282,19 +282,135 @@ def insider_bundle_size(graph, report) -> tuple[int | None, str | None]:
                 sizes.append(counted)
     if sizes:
         return max(sizes), None
+    # A positive detection count is a measurement. Zero beside an empty network
+    # list is not: RugCheck leaves that list null until it has built the graph.
+    if isinstance(report, dict):
+        detected = _bundle_count(report.get("graphInsidersDetected"))
+        if detected is not None and detected > 0:
+            return detected, None
     if structured:
         return 0, None
-    if isinstance(report, dict) and report.get("insiderNetworks") == []:
-        detected = report.get("graphInsidersDetected")
-        if detected in (0, None):
-            return 0, None
     if graph is None and (not isinstance(report, dict) or "insiderNetworks" not in report):
         return None, "rugcheck unavailable"
     if isinstance(graph, list) and not graph:
         return None, "empty network"
+    if isinstance(report, dict) and report.get("insiderNetworks") in (None, []):
+        return None, "empty network"
     if graph is not None:
         return None, "links missing"
     return None, "rugcheck unavailable"
+
+
+def _ui_amount(row: dict):
+    amount = row.get("uiTokenAmount") if isinstance(row, dict) else None
+    if not isinstance(amount, dict):
+        return None
+    ui = amount.get("uiAmount")
+    if isinstance(ui, bool) or not isinstance(ui, (int, float)):
+        return None
+    return float(ui)
+
+
+def buyers_from_transaction(tx, mint: str, pool: str | None) -> list[str] | None:
+    """Wallets whose balance of mint increased. None when the transaction is unreadable."""
+    if not isinstance(tx, dict):
+        return None
+    meta = tx.get("meta")
+    if not isinstance(meta, dict) and isinstance(tx.get("result"), dict):
+        meta = tx["result"].get("meta")
+    if not isinstance(meta, dict):
+        return None
+    pre: dict[str, float] = {}
+    post: dict[str, float] = {}
+    for label, sink in (("preTokenBalances", pre), ("postTokenBalances", post)):
+        rows = meta.get(label)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict) or row.get("mint") != mint:
+                continue
+            owner = row.get("owner")
+            ui = _ui_amount(row)
+            if not isinstance(owner, str) or ui is None:
+                continue
+            sink[owner] = sink.get(owner, 0.0) + ui
+    buyers = []
+    for owner in set(pre) | set(post):
+        if pool and owner == pool:
+            continue
+        if post.get(owner, 0.0) - pre.get(owner, 0.0) > 1:
+            buyers.append(owner)
+    return buyers
+
+
+def _transfer_source(instruction, buyers: set[str]) -> str | None:
+    if not isinstance(instruction, dict):
+        return None
+    parsed = instruction.get("parsed")
+    if not isinstance(parsed, dict) or parsed.get("type") != "transfer":
+        return None
+    info = parsed.get("info")
+    if not isinstance(info, dict):
+        return None
+    source = info.get("source")
+    destination = info.get("destination")
+    if isinstance(source, str) and isinstance(destination, str) and destination in buyers and source not in buyers:
+        return source
+    return None
+
+
+def funder_from_transaction(tx, buyers: list[str]) -> str | None:
+    """A wallet that paid one of the buyers inside this transaction, when the transfer is parsed."""
+    if not buyers or not isinstance(tx, dict):
+        return None
+    result = tx.get("result") if isinstance(tx.get("result"), dict) else tx
+    message = ((result.get("transaction") or {}).get("message") or {}) if isinstance(result, dict) else {}
+    meta = result.get("meta") if isinstance(result, dict) else None
+    wanted = set(buyers)
+    instructions = list(message.get("instructions") or [])
+    for inner in (meta or {}).get("innerInstructions") or []:
+        if isinstance(inner, dict):
+            instructions.extend(inner.get("instructions") or [])
+    for instruction in instructions:
+        source = _transfer_source(instruction, wanted)
+        if source:
+            return source
+    return None
+
+
+def early_slot_bundle_size(events) -> tuple[int | None, str | None]:
+    """Largest set of early buyers that share a slot or a funding wallet.
+
+    events are {slot, buyers, funder?, missing?, error?}. An unreadable
+    transaction or a window with no buy is not a measurement.
+    """
+    if not events:
+        return None, "no signatures"
+    by_slot: dict = {}
+    by_funder: dict = {}
+    saw_buyer = False
+    for event in events:
+        if not isinstance(event, dict) or event.get("missing"):
+            return None, (event.get("error") if isinstance(event, dict) else None) or "tx missing"
+        buyers = event.get("buyers")
+        if not isinstance(buyers, (list, set, tuple)):
+            return None, "tx missing"
+        slot = event.get("slot")
+        group = by_slot.setdefault(slot, set())
+        funder = event.get("funder")
+        funded = by_funder.setdefault(funder, set()) if isinstance(funder, str) and funder else None
+        for buyer in buyers:
+            if not isinstance(buyer, str) or not buyer:
+                continue
+            group.add(buyer)
+            if funded is not None and buyer != funder:
+                funded.add(buyer)
+            saw_buyer = True
+    if not saw_buyer:
+        return None, "early buys missing"
+    clusters = [len(group) for group in by_slot.values()]
+    clusters.extend(len(group) for group in by_funder.values() if group)
+    return max(clusters), None
 
 
 def rpc_mint_account(response) -> dict:
