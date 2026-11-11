@@ -213,6 +213,8 @@ def graph_nodes_links(payload):
     """nodes = [0].nodes. edges key is absent; [0].links is the edge list.
 
     Returns (nodes, links, links_key_missing, empty_network).
+    A list of networks still exposes the first one here. insider_bundle_size
+    reads every network.
     """
     if payload is None:
         return None, None, True, True
@@ -233,6 +235,66 @@ def graph_nodes_links(payload):
     if isinstance(nodes, list) and len(nodes) == 0 and len(links) == 0:
         return nodes, links, False, True
     return nodes if isinstance(nodes, list) else [], links, False, False
+
+
+def _bundle_count(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def insider_bundle_size(graph, report) -> tuple[int | None, str | None]:
+    """Largest RugCheck insider network, in wallets.
+
+    The graph is a list of networks. Each network's node count is the bundle.
+    insiderNetworks[].size on the report is the same number and still counts
+    when the first network has no links list. None means the source did not
+    answer, which must fail closed.
+    """
+    sizes: list[int] = []
+    if isinstance(report, dict) and isinstance(report.get("insiderNetworks"), list):
+        for net in report["insiderNetworks"]:
+            if not isinstance(net, dict):
+                continue
+            counted = _bundle_count(net.get("size"))
+            if counted is None and "size" not in net:
+                counted = _bundle_count(net.get("activeAccounts"))
+            if counted is not None:
+                sizes.append(counted)
+
+    networks: list[dict] = []
+    if isinstance(graph, list):
+        networks = [item for item in graph if isinstance(item, dict)]
+    elif isinstance(graph, dict):
+        networks = [graph]
+
+    structured = False
+    for net in networks:
+        nodes = net.get("nodes") if isinstance(net.get("nodes"), list) else None
+        if nodes is not None or "links" in net or "size" in net:
+            structured = True
+        if nodes:
+            ids = [node.get("id") for node in nodes if isinstance(node, dict) and node.get("id") is not None]
+            sizes.append(len(set(ids)) if ids else len(nodes))
+        else:
+            counted = _bundle_count(net.get("size")) if "size" in net else None
+            if counted is not None:
+                sizes.append(counted)
+    if sizes:
+        return max(sizes), None
+    if structured:
+        return 0, None
+    if isinstance(report, dict) and report.get("insiderNetworks") == []:
+        detected = report.get("graphInsidersDetected")
+        if detected in (0, None):
+            return 0, None
+    if graph is None and (not isinstance(report, dict) or "insiderNetworks" not in report):
+        return None, "rugcheck unavailable"
+    if isinstance(graph, list) and not graph:
+        return None, "empty network"
+    if graph is not None:
+        return None, "links missing"
+    return None, "rugcheck unavailable"
 
 
 def rpc_mint_account(response) -> dict:
@@ -308,9 +370,18 @@ def largest_account_rows(response) -> list | None:
 
 
 def program_account_rows(response) -> list | None:
-    value = pick(response, "result.value")
-    if value is MISSING or value is None:
+    """Token accounts from getProgramAccounts or a result.value list.
+
+    getProgramAccounts returns the rows on result itself. getTokenAccountsByOwner
+    nests them under result.value. A present empty list is a real empty read.
+    """
+    if not isinstance(response, dict) or "result" not in response:
         return None
-    if not isinstance(value, list):
+    result = response.get("result")
+    if isinstance(result, list):
+        value = result
+    elif isinstance(result, dict) and isinstance(result.get("value"), list):
+        value = result["value"]
+    else:
         return None
     return [token_account_fields(item) for item in value if isinstance(item, dict)]

@@ -8,6 +8,7 @@ from config import iso, parse_iso, utc_now
 from fields import (
     MISSING,
     graph_nodes_links,
+    insider_bundle_size,
     program_account_rows,
     rpc_mint_account,
     rpc_supply_ui,
@@ -284,7 +285,16 @@ def audit_from_facts(facts: dict) -> dict:
         return finish(False, "pool too young", 6)
 
     # 7 bundles
-    if facts.get("links_missing") or facts.get("empty_network"):
+    if "bundle_size" in facts:
+        size = facts.get("bundle_size")
+        if isinstance(size, bool) or not isinstance(size, (int, float)):
+            cause = facts.get("bundle_error") or "missing"
+            value = f"no data: bundles ({cause})"
+            layers.append(_layer(7, False, value, "rugcheck"))
+            _rest(8, layers)
+            return finish(False, value, 7)
+        size = int(size)
+    elif facts.get("links_missing") or facts.get("empty_network"):
         if facts.get("bundle_error"):
             cause = facts["bundle_error"]
         elif facts.get("links_missing"):
@@ -295,7 +305,8 @@ def audit_from_facts(facts: dict) -> dict:
         layers.append(_layer(7, False, value, "rugcheck"))
         _rest(8, layers)
         return finish(False, value, 7)
-    size = biggest_bundle(facts.get("nodes") or [], facts.get("links") or [])
+    else:
+        size = biggest_bundle(facts.get("nodes") or [], facts.get("links") or [])
     if size >= int(settings["auditor.max_bundled"]):
         value = f"{size} bundled wallets"
         layers.append(_layer(7, False, value, "rugcheck"))
@@ -333,7 +344,6 @@ class Auditor:
         self.db = db
         self.settings = settings
         self.bus = bus
-        self._announced_layer8 = False
 
     async def run(self) -> None:
         while True:
@@ -435,25 +445,8 @@ class Auditor:
                     top10_error = rpc_error or top10_error
                 else:
                     top10_error = None
-            accounts = None
-            delegations_error = "rpc refused" if self.settings.get("desk.layer8_down") else None
-            delegations_down = bool(self.settings.get("desk.layer8_down"))
-            if not delegations_down:
-                try:
-                    accounts, delegations_error = await self._delegations(rpc_url, mint, client, retries)
-                except RpcRefused:
-                    delegations_down = True
-                    delegations_error = "rpc refused"
-                    accounts = None
-                    self.settings.set("desk.layer8_down", True, "auditor")
-                    if not self._announced_layer8:
-                        self._announced_layer8 = True
-                        await self.bus.events.put(
-                            {
-                                "type": "text",
-                                "text": "layer 8 down, every coin is red until rpc_url changes",
-                            }
-                        )
+            accounts, delegations_error = await self._delegations(rpc_url, mint, client, retries)
+            delegations_down = False
         mint_account = rpc_mint_account(mint_resp) if mint_resp else {
             "mintAuthority": MISSING,
             "freezeAuthority": MISSING,
@@ -461,14 +454,12 @@ class Auditor:
             "decimals": None,
         }
         nodes, links, links_missing, empty_network = graph_nodes_links(graph)
-        if graph is None:
-            bundle_error = "rugcheck unavailable"
-        elif links_missing:
-            bundle_error = "links missing"
-        elif empty_network:
-            bundle_error = "empty network"
-        else:
-            bundle_error = None
+        bundle_size, bundle_error = insider_bundle_size(graph, report if isinstance(report, dict) else None)
+        if bundle_size is None and not bundle_error:
+            bundle_error = "missing"
+        if bundle_size is not None:
+            links_missing = False
+            empty_network = False
         pool_for_lp = message.get("pool") or (coin["pool"] if coin else None)
         lp = rug_lp(report or {}, pool_for_lp)
         if report is None:
@@ -500,6 +491,7 @@ class Auditor:
             "top10_error": top10_error,
             "liquidity_error": liquidity_error,
             "bundle_error": bundle_error,
+            "bundle_size": bundle_size,
             "delegations_error": delegations_error,
             "lp_found": lp["found"],
             "lp_locked": lp["locked"],
@@ -664,7 +656,16 @@ class Auditor:
         return out, None
 
     async def _delegations(self, rpc_url, mint, client, retries):
+        """Delegates on token accounts. Both programs are read.
+
+        getProgramAccounts puts rows on result, and the classic program is an
+        empty list for a Token-2022 mint. That empty list must not hide the
+        Token-2022 accounts. When the scan does not answer, the largest
+        accounts' parsed delegate fields are the fallback.
+        """
         rows = []
+        errors = []
+        answered = False
         for program in (TOKEN_PROGRAM, TOKEN_2022):
             body, error = await self._rpc_call(
                 client,
@@ -679,15 +680,21 @@ class Auditor:
                 ],
                 retries,
             )
-            if error == "rpc refused":
-                raise RpcRefused(error)
             if body is None:
-                return None, error
+                errors.append(error or "rpc unavailable")
+                continue
             parsed = program_account_rows(body)
             if parsed is None:
-                return None, "accounts missing"
+                errors.append(error or "accounts missing")
+                continue
+            answered = True
             rows.extend(parsed)
-        return rows, None
+        if rows or (answered and not errors):
+            return rows, None
+        largest, largest_error = await self._largest(rpc_url, mint, client, retries)
+        if largest is not None:
+            return largest, None
+        return None, (errors[0] if errors else largest_error or "accounts missing")
 
 
 def _sum_owner_balance(response) -> float | None:
