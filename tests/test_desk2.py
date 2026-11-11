@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -10,7 +11,9 @@ from config import DeskSettings, defaults
 from db import Database
 from instance import DESK2_LIQUIDITY, apply_instance, resolve_instance, setting_overrides
 from livecrypto import decrypt_envelope, envelope_bytes, encrypt_envelope, is_live_path
+from logutil import file_logger, log
 from publish_live import load_live_files
+from secrets_env import force_live_refused, load_user_secrets, parse_env_text
 from telegram import Telegram
 
 FIXTURE_DATA_PATH = "fixture-path-0123456789abcdef0123456789"
@@ -48,6 +51,11 @@ def test_instances_keep_separate_db_balance_and_liquidity(tmp_path):
     assert desk2_env["JSON_ROOT"] == "var/desk2/json"
     assert desk2_env["DESK_LIVE_PREFIX"] == "desk2"
     assert desk2_env["DESK_TELEGRAM"] == "0"
+    assert desk2_env["DESK_INSTANCE"] == "desk2"
+    forced = {"DESK_TELEGRAM": "1", "DESK_DB": "var/other.db"}
+    apply_instance("desk2", forced)
+    assert forced["DESK_TELEGRAM"] == "0"
+    assert forced["DESK_DB"] == "var/other.db"
     custom = {"DESK_DB": "var/custom.db"}
     apply_instance("desk2", custom)
     assert custom["DESK_DB"] == "var/custom.db"
@@ -231,3 +239,65 @@ def test_desk2_live_files_publish_beside_desk1(tmp_path, monkeypatch):
         assert "desk2/state.json" in json.loads((root / "desk2" / ".plain-hashes.json").read_text(encoding="utf-8"))
     finally:
         db.close()
+
+
+def test_secrets_file_parsing_never_keeps_comments_and_refuses_force_live(tmp_path):
+    text = """
+# comment
+DATA_PATH="fixture-path-0123456789abcdef0123456789"
+export DESK_TELEGRAM=1
+set FORCE_LIVE=yes
+$env:FOMO_HANDLE = 'operator'
+blank
+"""
+    parsed = parse_env_text(text)
+    assert parsed["DATA_PATH"] == "fixture-path-0123456789abcdef0123456789"
+    assert parsed["DESK_TELEGRAM"] == "1"
+    assert parsed["FORCE_LIVE"] == "yes"
+    assert parsed["FOMO_HANDLE"] == "operator"
+    assert "blank" not in parsed
+    env = {"DATA_PATH": "already-set-path-0123456789abcdef"}
+    secret = tmp_path / "env"
+    secret.write_text(text, encoding="utf-8")
+    load_user_secrets(env, secret)
+    assert env["DATA_PATH"] == "already-set-path-0123456789abcdef"
+    assert env["FOMO_HANDLE"] == "operator"
+    assert force_live_refused(env) is True
+    assert force_live_refused({"FORCE_LIVE": "0"}) is False
+    assert force_live_refused({}) is False
+    missing = tmp_path / "missing-env"
+    try:
+        load_user_secrets({}, missing)
+    except OSError as exc:
+        assert "fixture-path" not in str(exc)
+
+
+def test_desk2_logs_follow_log_dir_after_import(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LOG_DIR", raising=False)
+    logger = file_logger("desk2-log-test", "scanner.log")
+    assert not (tmp_path / "logs" / "scanner.log").exists()
+    monkeypatch.setenv("LOG_DIR", "logs/desk2")
+    log(logger, "desk2 line")
+    written = tmp_path / "logs" / "desk2" / "scanner.log"
+    assert written.is_file()
+    assert written.read_text(encoding="utf-8").strip() == "desk2 line"
+    assert not (tmp_path / "logs" / "scanner.log").exists()
+    monkeypatch.delenv("LOG_DIR", raising=False)
+    other = file_logger("desk1-log-test", "main.log")
+    log(other, "desk1 line")
+    assert (tmp_path / "logs" / "main.log").read_text(encoding="utf-8").strip() == "desk1 line"
+
+
+def test_launcher_files_keep_telegram_off_and_do_not_hardcode_a_user():
+    script = Path("run-desk2.ps1").read_text(encoding="utf-8")
+    assert ".desk-secrets" in script
+    assert "FORCE_LIVE is refused." in script
+    assert '$env:DESK_INSTANCE = "desk2"' in script
+    assert '$env:DESK_TELEGRAM = "0"' in script
+    assert "Write-Host" not in script
+    cmd = Path("GrokDesk2.cmd").read_text(encoding="utf-8")
+    assert r"%USERPROFILE%\grok-desk\run-desk2.ps1" in cmd
+    assert "DESK_HOME" in cmd
+    assert "kwiat" not in cmd
+    assert "WindowStyle Hidden" in cmd

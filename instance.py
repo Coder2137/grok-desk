@@ -36,9 +36,11 @@ def apply_instance(name: str, environ: dict | None = None) -> None:
         env["DESK_DB"] = "var/desk2.db"
     if env.get("JSON_ROOT", "var/json") in ("", "var/json"):
         env["JSON_ROOT"] = "var/desk2/json"
+    env["DESK_INSTANCE"] = DESK2
     env.setdefault("LOG_DIR", "logs/desk2")
     env.setdefault("DESK_LIVE_PREFIX", "desk2")
-    env.setdefault("DESK_TELEGRAM", "0")
+    # The secrets file may turn Telegram on. Desk 2 stays off.
+    env["DESK_TELEGRAM"] = "0"
     env.setdefault("DESK_FEED_OFFSET", "var/desk2/feed.offset")
     env.setdefault("LOCAL_PORT", "8766")
 

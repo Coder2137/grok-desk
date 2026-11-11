@@ -35,7 +35,7 @@ Set these in the environment or in a gitignored `.env`. Do not commit the values
 
 A second paper desk can run beside this one. It does not change desk 1's database, $40,000 liquidity floor, or Telegram. Start it with `DESK_INSTANCE=desk2` or `python main.py --instance desk2`. The Windows launchers are `run-desk2.ps1` and `GrokDesk2.cmd`.
 
-Desk 2 uses `var/desk2.db`, plaintext under `var/desk2/json`, and a $200 paper stack. Its scanner liquidity floor is $10,000. Every other filter matches desk 1. LIVE uses the same refusal as desk 1. Telegram stays off unless `DESK_TELEGRAM=1`.
+Desk 2 uses `var/desk2.db`, plaintext under `var/desk2/json`, and a $200 paper stack. Its scanner liquidity floor is $10,000. Every other filter matches desk 1. `run-desk2.ps1` loads `%USERPROFILE%\.desk-secrets\env` the same way as desk 1 and never prints those values. `FORCE_LIVE` is refused. `DESK_INSTANCE` stays `desk2` and `DESK_TELEGRAM` stays `0`, even if the secrets file says otherwise, so desk 2 does not send Telegram. Logs go to `logs/desk2/`. `GrokDesk2.cmd` can sit in the Startup folder: it runs `%USERPROFILE%\grok-desk\run-desk2.ps1`, or `%DESK_HOME%\run-desk2.ps1` when `DESK_HOME` is set.
 
 Only desk 1 opens the PumpPortal websocket. It appends each migration frame to `var/feed/migrations.jsonl`. Desk 2 reads that file. If desk 2 is stopped, desk 1 keeps appending and does not wait on it.
 
