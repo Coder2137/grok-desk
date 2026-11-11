@@ -171,6 +171,24 @@ def rug_report_fields(report) -> dict:
     }
 
 
+def _market_has_pool(market: dict, pool: str | None) -> bool:
+    if not pool:
+        return False
+    if as_text(pick(market, "pubkey")) == pool:
+        return True
+
+    def walk(value) -> bool:
+        if isinstance(value, str):
+            return value == pool
+        if isinstance(value, dict):
+            return any(walk(item) for item in value.values())
+        if isinstance(value, list):
+            return any(walk(item) for item in value)
+        return False
+
+    return walk(market)
+
+
 def rug_lp(report, pool: str) -> dict:
     """Market whose pubkey equals the scanner pool. Burned % has no sample key."""
     markets = pick(report, "markets") if isinstance(report, dict) else MISSING
@@ -179,7 +197,7 @@ def rug_lp(report, pool: str) -> dict:
     for market in markets:
         if not isinstance(market, dict):
             continue
-        if as_text(pick(market, "pubkey")) != pool:
+        if not _market_has_pool(market, pool):
             continue
         locked = pick(market, "lp.lpLockedPct")
         # No burned key in the STEP 2 sample. Do not invent one.

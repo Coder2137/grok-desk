@@ -195,27 +195,33 @@ def audit_from_facts(facts: dict) -> dict:
     layers.append(_layer(3, True, f"{_fmt_pct(dev_pct)}% · sold 0", "rpc"))
 
     # 4 top 10
+    measured = facts.get("top10_pct")
     largest = facts.get("largest")
-    if largest is None:
-        layers.append(_layer(4, False, "no data: top 10", "rpc"))
+    if measured is None and largest is None:
+        cause = facts.get("top10_error") or "missing"
+        value = f"no data: top 10 ({cause})"
+        layers.append(_layer(4, False, value, "rpc"))
         _rest(5, layers)
-        return finish(False, "no data: top 10", 4)
-    pool = facts.get("pool")
-    curve = facts.get("curve")
-    kept = []
-    for row in largest:
-        owner = row.get("owner")
-        address = row.get("address")
-        if pool and (owner == pool or address == pool):
-            continue
-        if curve and (owner == curve or address == curve):
-            continue
-        if row.get("balance") is None:
-            continue
-        kept.append(row)
-    kept.sort(key=lambda item: item["balance"], reverse=True)
-    top = kept[:10]
-    top_pct = sum(item["balance"] for item in top) / supply * 100.0
+        return finish(False, value, 4)
+    if measured is None:
+        pool = facts.get("pool")
+        curve = facts.get("curve")
+        kept = []
+        for row in largest:
+            owner = row.get("owner")
+            address = row.get("address")
+            if pool and (owner == pool or address == pool):
+                continue
+            if curve and (owner == curve or address == curve):
+                continue
+            if row.get("balance") is None:
+                continue
+            kept.append(row)
+        kept.sort(key=lambda item: item["balance"], reverse=True)
+        top = kept[:10]
+        top_pct = sum(item["balance"] for item in top) / supply * 100.0
+    else:
+        top_pct = float(measured)
     if top_pct >= float(settings["auditor.max_top10_pct"]):
         value = f"top 10 hold {_fmt_pct(top_pct)}%"
         layers.append(_layer(4, False, value, "rpc"))
@@ -225,15 +231,18 @@ def audit_from_facts(facts: dict) -> dict:
 
     # 5 liquidity
     if not facts.get("lp_found"):
-        layers.append(_layer(5, False, "no data: liquidity", "rugcheck"))
+        cause = facts.get("liquidity_error") or "missing"
+        value = f"no data: liquidity ({cause})"
+        layers.append(_layer(5, False, value, "rugcheck"))
         _rest(6, layers)
-        return finish(False, "no data: liquidity", 5)
+        return finish(False, value, 5)
     current_liq = facts.get("current_liquidity")
     scanner_liq = facts.get("scanner_liquidity")
     if current_liq is None or scanner_liq is None:
-        layers.append(_layer(5, False, "no data: liquidity", "rugcheck"))
+        value = "no data: liquidity (amount missing)"
+        layers.append(_layer(5, False, value, "rugcheck"))
         _rest(6, layers)
-        return finish(False, "no data: liquidity", 5)
+        return finish(False, value, 5)
     if float(current_liq) < float(scanner_liq) * 0.5:
         layers.append(_layer(5, False, "liquidity pulled", "rugcheck"))
         _rest(6, layers)
@@ -248,9 +257,10 @@ def audit_from_facts(facts: dict) -> dict:
         shown = int(round(float(locked)))
         layers.append(_layer(5, True, f"{shown}% locked", "rugcheck"))
     elif locked is None and burned is None:
-        layers.append(_layer(5, False, "no data: liquidity", "rugcheck"))
+        value = "no data: liquidity (lock missing)"
+        layers.append(_layer(5, False, value, "rugcheck"))
         _rest(6, layers)
-        return finish(False, "no data: liquidity", 5)
+        return finish(False, value, 5)
     else:
         layers.append(_layer(5, False, "liquidity unlocked", "rugcheck"))
         _rest(6, layers)
@@ -259,9 +269,10 @@ def audit_from_facts(facts: dict) -> dict:
     # 6 age
     migrated = facts.get("migrated_at")
     if not migrated:
-        layers.append(_layer(6, False, "no data: pool age", "rpc"))
+        value = "no data: pool age (migrated_at missing)"
+        layers.append(_layer(6, False, value, "rpc"))
         _rest(7, layers)
-        return finish(False, "no data: pool age", 6)
+        return finish(False, value, 6)
     moment = parse_iso(migrated) if isinstance(migrated, str) else migrated
     now = facts.get("now") or utc_now()
     age_min = (now - moment).total_seconds() / 60.0
@@ -274,9 +285,16 @@ def audit_from_facts(facts: dict) -> dict:
 
     # 7 bundles
     if facts.get("links_missing") or facts.get("empty_network"):
-        layers.append(_layer(7, False, "no data: bundles", "rugcheck"))
+        if facts.get("bundle_error"):
+            cause = facts["bundle_error"]
+        elif facts.get("links_missing"):
+            cause = "links missing"
+        else:
+            cause = "empty network"
+        value = f"no data: bundles ({cause})"
+        layers.append(_layer(7, False, value, "rugcheck"))
         _rest(8, layers)
-        return finish(False, "no data: bundles", 7)
+        return finish(False, value, 7)
     size = biggest_bundle(facts.get("nodes") or [], facts.get("links") or [])
     if size >= int(settings["auditor.max_bundled"]):
         value = f"{size} bundled wallets"
@@ -286,13 +304,12 @@ def audit_from_facts(facts: dict) -> dict:
     layers.append(_layer(7, True, "None" if size <= 1 else str(size), "rugcheck"))
 
     # 8 delegations
-    if facts.get("delegations_down"):
-        layers.append(_layer(8, False, "no data: delegations", "rpc"))
-        return finish(False, "no data: delegations", 8)
+    if facts.get("delegations_down") or facts.get("delegation_accounts") is None:
+        cause = facts.get("delegations_error") or "missing"
+        value = f"no data: delegations ({cause})"
+        layers.append(_layer(8, False, value, "rpc"))
+        return finish(False, value, 8)
     accounts = facts.get("delegation_accounts")
-    if accounts is None:
-        layers.append(_layer(8, False, "no data: delegations", "rpc"))
-        return finish(False, "no data: delegations", 8)
     holders = sum(1 for row in accounts if (row.get("balance") or 0) > 0)
     counts: dict[str, int] = {}
     for row in accounts:
@@ -408,14 +425,26 @@ class Auditor:
                 creator_balance, dev_error = await self._creator_balance(
                     client, rpc_url, creator, mint, rug_fields, retries
                 )
-            largest = await self._largest(rpc_url, mint, client, retries)
+            pool = message.get("pool") or (coin["pool"] if coin else None)
+            curve = message.get("curve")
+            top10_value, top10_error = self._top10_from_report(rug_fields, message, pool, curve)
+            largest = None
+            if top10_value is None:
+                largest, rpc_error = await self._largest(rpc_url, mint, client, retries)
+                if largest is None:
+                    top10_error = rpc_error or top10_error
+                else:
+                    top10_error = None
             accounts = None
+            delegations_error = "rpc refused" if self.settings.get("desk.layer8_down") else None
             delegations_down = bool(self.settings.get("desk.layer8_down"))
             if not delegations_down:
                 try:
-                    accounts = await self._delegations(rpc_url, mint, client, retries)
+                    accounts, delegations_error = await self._delegations(rpc_url, mint, client, retries)
                 except RpcRefused:
                     delegations_down = True
+                    delegations_error = "rpc refused"
+                    accounts = None
                     self.settings.set("desk.layer8_down", True, "auditor")
                     if not self._announced_layer8:
                         self._announced_layer8 = True
@@ -432,13 +461,30 @@ class Auditor:
             "decimals": None,
         }
         nodes, links, links_missing, empty_network = graph_nodes_links(graph)
-        lp = rug_lp(report or {}, message.get("pool") or (coin["pool"] if coin else None))
+        if graph is None:
+            bundle_error = "rugcheck unavailable"
+        elif links_missing:
+            bundle_error = "links missing"
+        elif empty_network:
+            bundle_error = "empty network"
+        else:
+            bundle_error = None
+        pool_for_lp = message.get("pool") or (coin["pool"] if coin else None)
+        lp = rug_lp(report or {}, pool_for_lp)
+        if report is None:
+            liquidity_error = "rugcheck unavailable"
+        elif not lp["found"]:
+            liquidity_error = "pool not in report"
+        elif lp["locked"] is None and lp["burned"] is None:
+            liquidity_error = "lock missing"
+        else:
+            liquidity_error = None
         migrated = coin["migrated_at"] if coin else message.get("migratedAt")
         return {
             "mint": mint,
             "ts": iso(utc_now()),
             "settings": settings,
-            "pool": message.get("pool") or (coin["pool"] if coin else None),
+            "pool": pool_for_lp,
             "curve": message.get("curve"),
             "migrated_at": migrated,
             "now": utc_now(),
@@ -450,6 +496,11 @@ class Auditor:
             "mint_authority": mint_account["mintAuthority"],
             "freeze_authority": mint_account["freezeAuthority"],
             "largest": largest,
+            "top10_pct": top10_value,
+            "top10_error": top10_error,
+            "liquidity_error": liquidity_error,
+            "bundle_error": bundle_error,
+            "delegations_error": delegations_error,
             "lp_found": lp["found"],
             "lp_locked": lp["locked"],
             "lp_burned": lp["burned"],
@@ -525,63 +576,118 @@ class Auditor:
             log(LOG, f"source failed {last.__class__.__name__}")
         return None
 
+    def _top10_from_report(self, rug_fields: dict, message: dict, pool, curve):
+        """Same holder math as the scanner. The scan's top10Pct is the fallback."""
+        from agents.scanner import top10_from_holders
+
+        holders = rug_fields.get("topHolders") if isinstance(rug_fields, dict) else None
+        if isinstance(holders, list) and holders:
+            measured = top10_from_holders(holders, pool, curve)
+            if measured is not None:
+                return measured, None
+            holders_error = "topHolders missing"
+        elif rug_fields:
+            holders_error = "topHolders missing"
+        else:
+            holders_error = "rugcheck unavailable"
+        scanned = message.get("top10Pct")
+        if isinstance(scanned, (int, float)) and not isinstance(scanned, bool):
+            return float(scanned), None
+        return None, holders_error
+
+    async def _rpc_call(self, client, rpc_url, method, params, retries):
+        last = "rpc unavailable"
+        for attempt in range(max(1, retries)):
+            try:
+                response = await client.post(
+                    rpc_url,
+                    json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                    timeout=20,
+                )
+            except Exception as exc:
+                last = exc.__class__.__name__
+            else:
+                if response.status_code == 429:
+                    last = "rpc 429"
+                elif response.status_code in (401, 403):
+                    return None, "rpc refused"
+                elif response.status_code >= 400:
+                    last = f"rpc http {response.status_code}"
+                else:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                        last = "rpc report"
+                    if isinstance(body, dict) and body.get("error"):
+                        message = body["error"].get("message", "") if isinstance(body["error"], dict) else ""
+                        lowered = str(message).lower()
+                        if "not allowed" in lowered or "excluded" in lowered or "forbidden" in lowered:
+                            return None, "rpc refused"
+                        last = "rpc error"
+                    elif isinstance(body, dict):
+                        return body, None
+            if attempt + 1 < retries:
+                await asyncio.sleep(min(8, 2 ** attempt))
+        return None, last
+
     async def _largest(self, rpc_url, mint, client, retries):
-        body = await self._retry(
-            lambda: rpc(rpc_url, "getTokenLargestAccounts", [mint], client),
-            retries,
-        )
+        body, error = await self._rpc_call(client, rpc_url, "getTokenLargestAccounts", [mint], retries)
         if not body:
-            return None
+            return None, error
         from fields import largest_account_rows
 
         rows = largest_account_rows(body)
         if rows is None:
-            return None
+            return None, "largest accounts missing"
         addresses = [row["address"] for row in rows]
         if not addresses:
-            return []
-        parsed = await self._retry(
-            lambda: rpc(rpc_url, "getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}], client),
+            return [], None
+        parsed, error = await self._rpc_call(
+            client,
+            rpc_url,
+            "getMultipleAccounts",
+            [addresses, {"encoding": "jsonParsed"}],
             retries,
         )
         value = None
         if isinstance(parsed, dict):
             value = parsed.get("result", {}).get("value") if isinstance(parsed.get("result"), dict) else None
         if not isinstance(value, list):
-            return None
+            return None, error or "largest accounts missing"
         out = []
         for address, account in zip(addresses, value):
             wrapped = {"account": account} if isinstance(account, dict) else {}
             fields = token_account_fields(wrapped)
             fields["address"] = address
             out.append(fields)
-        return out
+        return out, None
 
     async def _delegations(self, rpc_url, mint, client, retries):
         rows = []
         for program in (TOKEN_PROGRAM, TOKEN_2022):
-            body = await self._retry(
-                lambda program=program: rpc(
-                    rpc_url,
-                    "getProgramAccounts",
-                    [
-                        program,
-                        {
-                            "encoding": "jsonParsed",
-                            "filters": [{"memcmp": {"offset": 0, "bytes": mint}}],
-                        },
-                    ],
-                    client,
-                ),
+            body, error = await self._rpc_call(
+                client,
+                rpc_url,
+                "getProgramAccounts",
+                [
+                    program,
+                    {
+                        "encoding": "jsonParsed",
+                        "filters": [{"memcmp": {"offset": 0, "bytes": mint}}],
+                    },
+                ],
                 retries,
             )
+            if error == "rpc refused":
+                raise RpcRefused(error)
             if body is None:
-                return None
+                return None, error
             parsed = program_account_rows(body)
             if parsed is None:
-                return None
+                return None, "accounts missing"
             rows.extend(parsed)
-        return rows
+        return rows, None
 
 
 def _sum_owner_balance(response) -> float | None:
