@@ -149,7 +149,7 @@ async def run() -> None:
     ]
     if os.environ.get("LOCAL_API") == "1":
         tasks.append(serve_local())
-    log(LOG, "desk up" if name == "desk1" else "desk2 up")
+    log(LOG, "desk up" if name == "desk1" else f"{name} up")
     await asyncio.gather(*tasks)
 
 
