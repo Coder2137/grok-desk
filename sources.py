@@ -74,6 +74,36 @@ async def dexscreener_batch(mints: list[str], client: httpx.AsyncClient | None =
             await http.aclose()
 
 
+async def dexscreener_pair(pair: str, client: httpx.AsyncClient) -> tuple[float | None, str | None]:
+    """Liquidity in USD for one pair. (None, reason) when the pair cannot be read."""
+    if not isinstance(pair, str) or len(pair) < 32:
+        return None, "pool not in report"
+    response = await client.get(f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair}", timeout=15)
+    if response.status_code == 429:
+        return None, "dexscreener 429"
+    if response.status_code >= 400:
+        return None, "dexscreener unavailable"
+    try:
+        body = response.json()
+    except ValueError:
+        return None, "dexscreener unavailable"
+    pairs = body.get("pairs") if isinstance(body, dict) else None
+    if not isinstance(pairs, list) or not pairs:
+        return None, "pool not in report"
+    for item in pairs:
+        if not isinstance(item, dict) or item.get("pairAddress") != pair:
+            continue
+        liquidity = item.get("liquidity") if isinstance(item.get("liquidity"), dict) else {}
+        usd = liquidity.get("usd")
+        try:
+            if usd is None or isinstance(usd, bool):
+                return None, "amount missing"
+            return float(usd), None
+        except (TypeError, ValueError):
+            return None, "amount missing"
+    return None, "pool not in report"
+
+
 async def rug_report(mint: str, client: httpx.AsyncClient) -> dict | None:
     response = await client.get(RUG_REPORT.format(mint=mint), timeout=15)
     if response.status_code >= 400:

@@ -19,7 +19,7 @@ from fields import (
     token_account_fields,
 )
 from logutil import file_logger, log
-from sources import TOKEN_2022, TOKEN_PROGRAM, RpcRefused, rpc, rpc_urls, rug_graph, rug_report
+from sources import TOKEN_2022, TOKEN_PROGRAM, RpcRefused, dexscreener_pair, rpc, rpc_urls, rug_graph, rug_report
 
 LOG = file_logger("auditor", "auditor.log")
 HEARTBEAT_S = 30
@@ -477,6 +477,25 @@ class Auditor:
                     bundle_size, bundle_error = measured, None
                 else:
                     bundle_error = measured_error or bundle_error or "missing"
+            pool_for_lp = pool
+            lp = rug_lp(report or {}, pool_for_lp)
+            dex_liquidity = None
+            if report is None:
+                liquidity_error = "rugcheck unavailable"
+            elif not lp["found"]:
+                try:
+                    dex_liquidity, dex_error = await dexscreener_pair(pool_for_lp or "", client)
+                except Exception:
+                    dex_liquidity, dex_error = None, "dexscreener unavailable"
+                if dex_liquidity is not None:
+                    lp = {"found": True, "locked": None, "burned": None}
+                    liquidity_error = "lock missing"
+                else:
+                    liquidity_error = dex_error or "pool not in report"
+            elif lp["locked"] is None and lp["burned"] is None:
+                liquidity_error = "lock missing"
+            else:
+                liquidity_error = None
         mint_account = rpc_mint_account(mint_resp) if mint_resp else {
             "mintAuthority": MISSING,
             "freezeAuthority": MISSING,
@@ -489,16 +508,6 @@ class Auditor:
             empty_network = False
         elif not bundle_error:
             bundle_error = "missing"
-        pool_for_lp = message.get("pool") or (coin["pool"] if coin else None)
-        lp = rug_lp(report or {}, pool_for_lp)
-        if report is None:
-            liquidity_error = "rugcheck unavailable"
-        elif not lp["found"]:
-            liquidity_error = "pool not in report"
-        elif lp["locked"] is None and lp["burned"] is None:
-            liquidity_error = "lock missing"
-        else:
-            liquidity_error = None
         migrated = coin["migrated_at"] if coin else message.get("migratedAt")
         return {
             "mint": mint,
@@ -525,7 +534,9 @@ class Auditor:
             "lp_found": lp["found"],
             "lp_locked": lp["locked"],
             "lp_burned": lp["burned"],
-            "current_liquidity": (message.get("dex") or {}).get("liquidityUsd", message.get("liquidityUsd")),
+            "current_liquidity": dex_liquidity
+            if dex_liquidity is not None
+            else (message.get("dex") or {}).get("liquidityUsd", message.get("liquidityUsd")),
             "scanner_liquidity": message.get("liquidityUsd"),
             "nodes": nodes,
             "links": links,
@@ -694,15 +705,26 @@ class Auditor:
             return None, "account not found"
         return out, None
 
+    async def _rpc_across(self, rpc_url, method, params, client, retries):
+        errors = []
+        for url in rpc_urls(rpc_url):
+            body, error = await self._rpc_call(client, url, method, params, retries)
+            if body is not None:
+                return body, None
+            if error:
+                errors.append(error)
+        return None, self._prefer_rpc_error(errors) if errors else "rpc unavailable"
+
     async def _signature_pages(self, client, rpc_url, address, retries):
         collected = []
         before = None
-        for _page in range(8):
+        seen = set()
+        while True:
             options = {"limit": 1000}
             if before:
                 options["before"] = before
-            body, error = await self._rpc_call(
-                client, rpc_url, "getSignaturesForAddress", [address, options], retries
+            body, error = await self._rpc_across(
+                rpc_url, "getSignaturesForAddress", [address, options], client, retries
             )
             if body is None:
                 return None, error or "rpc unavailable", False
@@ -712,11 +734,11 @@ class Auditor:
             collected.extend(item for item in result if isinstance(item, dict))
             if len(result) < 1000:
                 return collected, None, False
-            last = result[-1]
-            before = last.get("signature") if isinstance(last, dict) else None
-            if not before:
-                return None, "signatures missing", False
-        return collected, None, True
+            last = result[-1].get("signature") if isinstance(result[-1], dict) else None
+            if not last or last in seen:
+                return collected, None, True
+            seen.add(last)
+            before = last
 
     async def _early_bundle(self, client, rpc_url, pool, mint, retries):
         """Same-slot buyers, and buyers funded inside the same transaction.
@@ -743,11 +765,11 @@ class Auditor:
         usable.sort(key=lambda row: (row.get("slot") or 0, row.get("transactionIndex") or 0))
         events = []
         for row in usable[:40]:
-            body, tx_error = await self._rpc_call(
-                client,
+            body, tx_error = await self._rpc_across(
                 rpc_url,
                 "getTransaction",
                 [row["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}],
+                client,
                 retries,
             )
             result = body.get("result") if isinstance(body, dict) else None
