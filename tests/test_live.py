@@ -27,6 +27,7 @@ from publish_live import (
     git_blob_sha,
     load_live_files,
     owner_repo,
+    progress_path,
     publish,
 )
 
@@ -290,12 +291,13 @@ class _Api:
         if request.method == "GET" and rest.startswith("/git/trees/"):
             sha = rest.split("?", 1)[0].rsplit("/", 1)[-1]
             recursive = "recursive=1" in str(request.url)
-            tree = self.flatten(sha) if recursive else self.trees[sha]
-            return httpx.Response(200, json={"sha": sha, "tree": tree, "truncated": False})
-        if self.rate_limit and request.method == "POST" and rest in ("/git/blobs", "/git/trees"):
+            truncated = bool(getattr(self, "truncate_recursive", False) and recursive)
+            tree = [] if truncated else (self.flatten(sha) if recursive else self.trees[sha])
+            return httpx.Response(200, json={"sha": sha, "tree": tree, "truncated": truncated})
+        if self._rate_limited(rest):
             headers = {}
             if self.rate_limit == "retry-after":
-                headers["Retry-After"] = "120"
+                headers["Retry-After"] = str(getattr(self, "retry_after_s", 120))
             elif self.rate_limit == "reset":
                 headers["x-ratelimit-reset"] = str(int(time.time()) + 180)
             self.rate_hits = getattr(self, "rate_hits", 0) + 1
@@ -370,10 +372,28 @@ class _Api:
             return httpx.Response(200, json={"object": {"sha": self.pages_ref}})
         return httpx.Response(500, json={"message": "unexpected"})
 
+    def _rate_limited(self, rest: str) -> bool:
+        if not self.rate_limit or rest not in ("/git/blobs", "/git/trees"):
+            return False
+        if getattr(self, "trees_before_limit", None) is not None:
+            if rest != "/git/trees":
+                return False
+            return len(self.tree_posts) >= self.trees_before_limit
+        return True
+
 
 def _github(api: _Api) -> GitHub:
     client = httpx.Client(transport=httpx.MockTransport(api.handler), base_url="https://api.github.com")
-    return GitHub(FIXTURE_TOKEN, "example/desk", client=client)
+    return GitHub(FIXTURE_TOKEN, "example/desk", client=client, sleep=lambda _seconds: None)
+
+
+def _until_settled(root: Path, github: GitHub, limit: int = 800) -> str:
+    result = ""
+    for _ in range(limit):
+        result = publish(root, github)
+        if result != "partial":
+            return result
+    raise AssertionError(result)
 
 
 def _envelopes(root: Path) -> None:
@@ -685,7 +705,7 @@ def test_publish_sends_only_changed_files(tmp_path, monkeypatch):
     api = _Api()
     github = _github(api)
     try:
-        assert publish(root, github) == "updated"
+        assert _until_settled(root, github) == "updated"
         kept = root / "coin" / "Coin0000.json"
         kept.unlink()
         api.tree_posts.clear()
@@ -779,7 +799,7 @@ def test_catch_up_of_1068_files_chunks_trees_and_posts_no_blobs(tmp_path):
     github = _github(api)
     try:
         api.reject_large_trees = True
-        assert publish(root, github) == "updated"
+        assert _until_settled(root, github) == "updated"
         assert len(api.blob_posts) == 1068
         assert api.tree_posts
         assert all(len(body["tree"]) <= _TREE_CHUNK for body in api.tree_posts)
@@ -793,7 +813,7 @@ def test_catch_up_of_1068_files_chunks_trees_and_posts_no_blobs(tmp_path):
         blobs_before = len(api.blob_posts)
         api.tree_posts.clear()
         _snapshot(root, 1068, salt="b")
-        assert publish(root, github) == "updated"
+        assert _until_settled(root, github) == "updated"
         assert len(api.blob_posts) - blobs_before == 1068
         assert all(len(body["tree"]) <= _TREE_CHUNK for body in api.tree_posts)
         pages_paths = [item["path"] for item in api.flatten(api.commits[api.pages_ref]["tree"])]
@@ -823,8 +843,9 @@ def test_ten_thousand_files_stay_in_small_trees_and_a_failed_batch_is_retried(tm
         client=httpx.Client(transport=httpx.MockTransport(api.handler), base_url="https://api.github.com"),
         sleep=lambda _seconds: None,
     )
+    github.write_budget = 100000
     try:
-        assert publish(root, github) == "updated"
+        assert _until_settled(root, github) == "updated"
         assert all(len(body["tree"]) <= _TREE_CHUNK for body in api.tree_posts)
         assert all(len(entries) <= 250 for entries in api.trees.values())
         paths = [item["path"] for item in api.flatten(api.commits[api.ref]["tree"])]
@@ -971,5 +992,155 @@ def test_main_tip_change_reaches_pages_src_without_replacing_ciphertext(tmp_path
         assert "mainsha2" not in api.commit_gets[gets:]
         assert (root / ".main-tip").read_text(encoding="utf-8").strip() == "mainsha2"
         assert ".main-tip" not in load_live_files(root)
+    finally:
+        github.close()
+
+
+def _envelope(token: str) -> bytes:
+    return json.dumps(
+        {"v": 1, "alg": "AES-256-GCM", "n": "AAAAAAAAAAAA", "c": token},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _seed_flat(api: _Api, files: dict[str, bytes]) -> None:
+    api.trees["seedtree"] = [
+        {"path": path, "mode": "100644", "type": "blob", "sha": git_blob_sha(content)}
+        for path, content in files.items()
+    ]
+    api.commits["seedcommit"] = {"tree": "seedtree", "parents": [], "message": "seed"}
+    api.ref = "seedcommit"
+
+
+def _wide_snapshot(root: Path, letters: int = 25, per: int = 4) -> dict[str, bytes]:
+    root.mkdir(parents=True)
+    (root / "coin").mkdir()
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    files: dict[str, bytes] = {}
+    for name in ("state.json", "chart.json", "activity.json"):
+        files[name] = _envelope(name)
+        (root / name).write_bytes(files[name])
+    for index in range(letters):
+        for count in range(per):
+            name = f"{alphabet[index]}{count}.json"
+            files[f"coin/{name}"] = _envelope(name)
+            (root / "coin" / name).write_bytes(files[f"coin/{name}"])
+    return files
+
+
+def test_sharded_publish_reuses_blobs_and_resumes_partial_progress(tmp_path):
+    root = tmp_path / "live"
+    files = _wide_snapshot(root)
+    orphan = _envelope("orphan")
+    seeded = dict(files)
+    seeded["coin/Zorphan.json"] = orphan
+    fresh = _envelope("fresh-state")
+    (root / "state.json").write_bytes(fresh)
+    api = _Api()
+    api.truncate_recursive = True
+    _seed_flat(api, seeded)
+    github = _github(api)
+    try:
+        assert publish(root, github) == "partial"
+        progress = progress_path(root)
+        assert progress == tmp_path / "publish-progress.json"
+        assert progress.name != PLAIN_HASHES
+        assert not progress.is_relative_to(root)
+        stored = json.loads(progress.read_text(encoding="utf-8"))
+        assert stored["v"] == 1
+        assert stored["dirs"]
+        assert len(stored["dirs"]) < 26
+        text = progress.read_text(encoding="utf-8")
+        assert FIXTURE_TOKEN not in text
+        assert FIXTURE_DATA_PATH not in text
+        assert "publish-progress.json" not in load_live_files(root)
+        assert PLAIN_HASHES not in load_live_files(root)
+        live = {item["path"]: item["sha"] for item in api.flatten(api.commits[api.ref]["tree"])}
+        assert live["state.json"] == git_blob_sha(fresh)
+        assert "coin/10.json" in live
+        pages = {item["path"]: item["sha"] for item in api.flatten(api.commits[api.pages_ref]["tree"])}
+        assert pages["web/live/state.json"] == git_blob_sha(fresh)
+        assert "web/live/coin/10.json" in pages
+        kept = {key: value["tree"] for key, value in stored["dirs"].items()}
+        posts = len(api.tree_posts)
+        assert _until_settled(root, github) == "updated"
+        after = json.loads(progress.read_text(encoding="utf-8"))["dirs"]
+        for key, sha in kept.items():
+            assert after[key]["tree"] == sha
+        assert len(api.tree_posts) - posts < len(after)
+        assert orphan not in api.blob_posts
+        assert all(body not in api.blob_posts for path, body in files.items() if path.startswith("coin/"))
+        final = [item["path"] for item in api.flatten(api.commits[api.ref]["tree"])]
+        coins = [path for path in final if path.startswith("coin/") and path.endswith(".json")]
+        assert len(coins) == len([path for path in files if path.startswith("coin/")]) + 1
+        assert "coin/Z/Zorphan.json" in coins
+        assert all(path.count("/") >= 2 for path in coins)
+        blobs = len(api.blob_posts)
+        assert publish(root, github) == "unchanged"
+        assert len(api.blob_posts) == blobs
+    finally:
+        github.close()
+
+
+def test_rate_limit_during_letter_backfill_resumes_without_reuploading(tmp_path):
+    root = tmp_path / "live"
+    files = _wide_snapshot(root)
+    fresh = _envelope("fresh-state")
+    (root / "state.json").write_bytes(fresh)
+    api = _Api()
+    api.truncate_recursive = True
+    _seed_flat(api, files)
+    api.rate_limit = "retry-after"
+    api.retry_after_s = 60
+    api.trees_before_limit = 6
+    github = _github(api)
+    try:
+        with pytest.raises(RateLimitError) as exc:
+            publish(root, github)
+        assert exc.value.status == 403
+        assert exc.value.wait_s == 60
+        assert FIXTURE_TOKEN not in str(exc.value)
+        progress = progress_path(root)
+        stored = json.loads(progress.read_text(encoding="utf-8"))
+        assert stored["dirs"]
+        assert FIXTURE_TOKEN not in progress.read_text(encoding="utf-8")
+        pages = {item["path"]: item["sha"] for item in api.flatten(api.commits[api.pages_ref]["tree"])}
+        assert pages["web/live/state.json"] == git_blob_sha(fresh)
+        live = {item["path"] for item in api.flatten(api.commits[api.ref]["tree"])}
+        assert "coin/10.json" in live
+        marker = backoff_marker(root)
+        assert marker == tmp_path / "publish-backoff-until"
+        assert "60" not in marker.name
+        kept = {key: value["tree"] for key, value in stored["dirs"].items()}
+        blobs = len(api.blob_posts)
+        posts = len(api.tree_posts)
+        marker.unlink()
+        api.rate_limit = None
+        assert _until_settled(root, github) == "updated"
+        after = json.loads(progress.read_text(encoding="utf-8"))["dirs"]
+        for key, sha in kept.items():
+            assert after[key]["tree"] == sha
+        assert len(api.tree_posts) - posts < len(after)
+        assert len(api.blob_posts) == blobs
+        assert all(body not in api.blob_posts for path, body in files.items() if path.startswith("coin/"))
+        coins = [item["path"] for item in api.flatten(api.commits[api.ref]["tree"]) if item["path"].startswith("coin/")]
+        assert len(coins) == 100
+        assert all(path.count("/") >= 2 for path in coins)
+    finally:
+        github.close()
+
+
+def test_rate_limit_reset_header_sets_the_wait(tmp_path):
+    root = tmp_path / "live"
+    _envelopes(root)
+    api = _Api()
+    api.rate_limit = "reset"
+    github = _github(api)
+    try:
+        with pytest.raises(RateLimitError) as exc:
+            publish(root, github)
+        assert exc.value.status == 403
+        assert 150 < exc.value.wait_s < 210
+        assert FIXTURE_TOKEN not in str(exc.value)
     finally:
         github.close()
