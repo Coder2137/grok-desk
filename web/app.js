@@ -377,7 +377,8 @@
     const rows = layers.map((layer) => `<div class="layer-row"><span>${layer.n} ${esc(layer.name)}</span><span>${esc(layer.value)}</span></div>`).join("");
     const done = layers.filter((layer) => layer.pass).length;
     const failed = layers.find((layer) => layer.pass === false && layer.value !== "not checked");
-    const copy = failed ? esc(failed.value) : done === 8 ? "8/8 → Executor" : "taking apart...";
+    const retrying = layers.some((layer) => layer && layer.value === "retrying");
+    const copy = failed ? esc(failed.value) : retrying ? "retrying" : done === 8 ? "8/8 → Executor" : "taking apart...";
     const enabled = state.data && state.data.auditorEnabled;
     const link = coin.link ? `<a class="btn" href="${esc(coin.link)}">Open on FOMO</a>` : "";
     return `
@@ -386,7 +387,7 @@
       <div class="discs"><i class="beam"></i>${discs}</div>
       <p class="note">${copy}</p>
       <div class="card">${rows || '<p class="empty">No coin taken apart yet</p>'}</div>
-      <p class="note">${failed ? "Rejected. " + esc(failed.value) : done === 8 ? "Cleared." : ""}</p>
+      <p class="note">${failed ? "Rejected. " + esc(failed.value) : retrying ? "retrying" : done === 8 ? "Cleared." : ""}</p>
       <div class="toggle"><span>Take apart before buying</span><i class="switch ${enabled ? "on" : ""}"><i></i></i></div>
       <p class="note">On in Telegram. Turning it off asks twice.</p>
       <div class="actions">${link}</div>
