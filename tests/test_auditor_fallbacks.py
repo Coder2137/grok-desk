@@ -125,7 +125,9 @@ def test_signatures_page_until_the_pool_start_and_a_stuck_cursor_is_incomplete(t
                 rows = [{"signature": "same", "slot": 1, "err": None} for _ in range(1000)]
                 return httpx.Response(200, json={"result": rows})
 
-        _rows, error, truncated = asyncio.run(run(Stuck()))
+        _rows, error, truncated = asyncio.run(
+            auditor._signature_pages(Stuck(), PUBLIC_RPC, "F" * 32, 1)
+        )
         assert truncated is True
         assert error is None
         assert stuck["n"] == 2

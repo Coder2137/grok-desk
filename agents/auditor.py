@@ -1,9 +1,14 @@
 """Auditor. Eight layers, stop at the first red. Seven of eight is a no."""
 
 import asyncio
+import json
+import os
+from datetime import timedelta
+from pathlib import Path
 
 import httpx
 
+import auditcache
 from config import iso, parse_iso, utc_now
 from fields import (
     MISSING,
@@ -23,6 +28,23 @@ from sources import TOKEN_2022, TOKEN_PROGRAM, RpcRefused, dexscreener_pair, rpc
 
 LOG = file_logger("auditor", "auditor.log")
 HEARTBEAT_S = 30
+# Three readings. A transient miss waits 2 minutes, then 5. The next try is
+# dropped when it would land after the scanner's pool-age window.
+MAX_AUDIT_TRIES = 3
+RETRY_DELAYS_S = (120, 300)
+_RPC_GAP_S = 0.2
+_RETRY_KEYS = (
+    "mint",
+    "name",
+    "symbol",
+    "pool",
+    "curve",
+    "liquidityUsd",
+    "top10Pct",
+    "migratedAt",
+    "dex",
+    "audit_attempt",
+)
 
 LAYER_NAMES = {
     1: "Mint authority",
@@ -110,6 +132,48 @@ def short_addr(value: str) -> str:
     if not value or len(value) <= 8:
         return value or ""
     return f"{value[:4]}...{value[-3:]}"
+
+
+def is_transient_cause(cause: str | None) -> bool:
+    """A rate limit, a timeout, or an unfinished early window. Not a measurement."""
+    if not cause:
+        return False
+    text = str(cause).lower()
+    if "429" in text or "timeout" in text or "early window incomplete" in text:
+        return True
+    return False
+
+
+def is_transient_reason(reason: str | None) -> bool:
+    if not reason or not str(reason).startswith("no data:"):
+        return False
+    return is_transient_cause(reason)
+
+
+def retry_file() -> Path:
+    override = os.environ.get("DESK_AUDIT_RETRY")
+    if override:
+        return Path(override)
+    db = os.environ.get("DESK_DB") or "var/desk.db"
+    return Path(db).with_name(Path(db).name + ".audit-retry.json")
+
+
+def _read_retries() -> dict:
+    try:
+        data = json.loads(retry_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    mints = data.get("mints") if isinstance(data, dict) else None
+    return mints if isinstance(mints, dict) else {}
+
+
+def _write_retries(mints: dict) -> None:
+    path = retry_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"v": 1, "mints": mints}, separators=(",", ":")), encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        return
 
 
 def _layer(number, passed, value, source):
@@ -367,11 +431,22 @@ class Auditor:
         self.db = db
         self.settings = settings
         self.bus = bus
+        self._pending: dict[str, tuple[str, dict]] = {}
+        self._rpc_turn = 0
+        self._rpc_lock = None
+        self._sleep = asyncio.sleep
+
+    def _lock(self) -> asyncio.Lock:
+        if self._rpc_lock is None:
+            self._rpc_lock = asyncio.Lock()
+        return self._rpc_lock
 
     async def run(self) -> None:
         while True:
+            self._load_pending()
+            self._release_due()
             try:
-                message = await asyncio.wait_for(self.bus.auditor.get(), timeout=HEARTBEAT_S)
+                message = await asyncio.wait_for(self.bus.auditor.get(), timeout=self._next_timeout())
             except asyncio.TimeoutError:
                 self.db.heartbeat("auditor")
                 continue
@@ -382,6 +457,118 @@ class Auditor:
                 log(LOG, f"auditor error {exc.__class__.__name__}")
             self.db.heartbeat("auditor")
 
+    def _next_timeout(self) -> float:
+        wait = float(HEARTBEAT_S)
+        now = utc_now()
+        for due, _message in self._pending.values():
+            try:
+                remaining = (parse_iso(due) - now).total_seconds()
+            except (TypeError, ValueError):
+                remaining = 0
+            wait = min(wait, max(0.0, remaining))
+        return wait
+
+    def _release_due(self) -> None:
+        now = utc_now()
+        ready = []
+        for mint, (due, _message) in self._pending.items():
+            try:
+                moment = parse_iso(due)
+            except (TypeError, ValueError):
+                ready.append(mint)
+                continue
+            if moment <= now:
+                ready.append(mint)
+        for mint in ready:
+            _due, message = self._pending.pop(mint)
+            self.bus.auditor.put_nowait(message)
+        if ready:
+            self._store_pending()
+
+    def _load_pending(self) -> None:
+        for mint, row in _read_retries().items():
+            if mint in self._pending or not isinstance(row, dict):
+                continue
+            message = row.get("message")
+            due = row.get("due")
+            if isinstance(message, dict) and isinstance(due, str) and message.get("mint"):
+                self._pending[str(mint)] = (due, message)
+
+    def _store_pending(self) -> None:
+        mints = {}
+        for mint, (due, message) in self._pending.items():
+            mints[mint] = {"due": due, "message": message}
+        _write_retries(mints)
+
+    def _clear_retry(self, mint: str) -> None:
+        self._pending.pop(mint, None)
+        if not retry_file().is_file():
+            return
+        mints = _read_retries()
+        if mint not in mints:
+            return
+        mints.pop(mint, None)
+        _write_retries(mints)
+
+    def _defer(self, message: dict, result: dict) -> bool:
+        """Keep a transient miss open. False means this reading is the last one."""
+        try:
+            attempt = int(message.get("audit_attempt") or 0)
+        except (TypeError, ValueError):
+            attempt = 0
+        if attempt < 0 or attempt + 1 >= MAX_AUDIT_TRIES:
+            return False
+        delay = RETRY_DELAYS_S[min(attempt, len(RETRY_DELAYS_S) - 1)]
+        if not self._inside_pool_window(message, delay):
+            return False
+        nxt = {key: message.get(key) for key in _RETRY_KEYS if key in message}
+        nxt["mint"] = message["mint"]
+        nxt["audit_attempt"] = attempt + 1
+        due = iso(utc_now() + timedelta(seconds=delay))
+        self._pending[message["mint"]] = (due, nxt)
+        self._store_pending()
+        result["retrying"] = True
+        result["retry_in_s"] = delay
+        return True
+
+    def _inside_pool_window(self, message: dict, delay_s: int) -> bool:
+        try:
+            limit = float(self.settings.get("scanner.max_wait_min"))
+        except (TypeError, ValueError):
+            limit = 60.0
+        coin = self.db.coin(message["mint"])
+        migrated = None
+        if coin and coin["migrated_at"]:
+            migrated = coin["migrated_at"]
+        elif message.get("migratedAt"):
+            migrated = message["migratedAt"]
+        if not migrated:
+            return True
+        moment = parse_iso(migrated) if isinstance(migrated, str) else migrated
+        age_min = (utc_now() + timedelta(seconds=delay_s) - moment).total_seconds() / 60.0
+        return age_min <= limit
+
+    def _write_layers(self, mint: str, result: dict, retrying: bool) -> None:
+        self.db.clear_audit(mint)
+        failed = result.get("reason")
+        for layer in result["layers"]:
+            value = layer["value"]
+            passed = layer["pass"]
+            if retrying and value == failed:
+                value = "retrying"
+                passed = None
+                layer["value"] = value
+                layer["pass"] = None
+            self.db.add_audit_layer(
+                mint,
+                result["ts"],
+                layer["n"],
+                layer["name"],
+                value,
+                passed,
+                layer["source"],
+            )
+
     async def handle(self, message: dict, enqueue: bool = True) -> dict:
         mint = message["mint"]
         since = self.settings.get("desk.night_start") or "1970"
@@ -389,20 +576,25 @@ class Auditor:
             return {"passed": False, "reason": "already rejected", "layers": []}
         facts = await self.gather(message)
         result = audit_from_facts(facts)
-        self.db.clear_audit(mint)
-        for layer in result["layers"]:
-            self.db.add_audit_layer(
-                mint,
-                result["ts"],
-                layer["n"],
-                layer["name"],
-                layer["value"],
-                layer["pass"],
-                layer["source"],
-            )
+        retrying = not result["passed"] and is_transient_reason(result.get("reason")) and self._defer(message, result)
+        if result["passed"] or not retrying:
+            self._clear_retry(mint)
+        self._write_layers(mint, result, retrying)
         if result.get("holders") is not None:
             self.db.upsert_coin(mint=mint, holders=result["holders"])
         parts = " ".join(f"L{layer['n']}={layer['value']}" for layer in result["layers"])
+        if retrying:
+            log(LOG, f"{mint} {parts} retrying in {result.get('retry_in_s')}s")
+            name = message.get("name") or mint
+            self.db.add_activity(
+                "retrying",
+                mint,
+                "Auditor",
+                f"Retrying {name}",
+                "Auditor · retrying",
+                "Later",
+            )
+            return result
         log(LOG, f"{mint} {parts} verdict {'pass' if result['passed'] else result['reason']}")
         if result["passed"] and enqueue:
             onward = dict(message)
@@ -468,15 +660,35 @@ class Auditor:
                     top10_error = rpc_error or top10_error
                 else:
                     top10_error = None
-            accounts, delegations_error = await self._delegations(rpc_url, mint, client, retries)
+            cached_delegations = auditcache.load_layer(mint, 8)
+            if isinstance(cached_delegations, dict) and isinstance(cached_delegations.get("accounts"), list):
+                accounts, delegations_error = cached_delegations["accounts"], None
+            elif (
+                isinstance(cached_delegations, dict)
+                and cached_delegations.get("error")
+                and not is_transient_cause(cached_delegations.get("error"))
+            ):
+                accounts, delegations_error = None, cached_delegations["error"]
+            else:
+                accounts, delegations_error = await self._delegations(rpc_url, mint, client, retries)
+                if accounts is not None or (delegations_error and not is_transient_cause(delegations_error)):
+                    auditcache.store_layer(mint, 8, {"accounts": accounts, "error": delegations_error})
             delegations_down = False
-            bundle_size, bundle_error = insider_bundle_size(graph, report if isinstance(report, dict) else None)
-            if bundle_size is None:
-                measured, measured_error = await self._early_bundle(client, rpc_url, pool, mint, retries)
-                if measured is not None:
-                    bundle_size, bundle_error = measured, None
-                else:
-                    bundle_error = measured_error or bundle_error or "missing"
+            cached_bundles = auditcache.load_layer(mint, 7)
+            if isinstance(cached_bundles, dict) and isinstance(cached_bundles.get("bundle_size"), int) and not isinstance(
+                cached_bundles.get("bundle_size"), bool
+            ):
+                bundle_size, bundle_error = cached_bundles["bundle_size"], None
+            else:
+                bundle_size, bundle_error = insider_bundle_size(graph, report if isinstance(report, dict) else None)
+                if bundle_size is None:
+                    measured, measured_error = await self._early_bundle(client, rpc_url, pool, mint, retries)
+                    if measured is not None:
+                        bundle_size, bundle_error = measured, None
+                    else:
+                        bundle_error = measured_error or bundle_error or "missing"
+                if bundle_size is not None or (bundle_error and not is_transient_cause(bundle_error)):
+                    auditcache.store_layer(mint, 7, {"bundle_size": bundle_size, "bundle_error": bundle_error})
             pool_for_lp = pool
             lp = rug_lp(report or {}, pool_for_lp)
             dex_liquidity = None
@@ -715,40 +927,154 @@ class Auditor:
                 errors.append(error)
         return None, self._prefer_rpc_error(errors) if errors else "rpc unavailable"
 
+    def _rotate(self, primary: str) -> list[str]:
+        urls = rpc_urls(primary)
+        if len(urls) > 1 and self._rpc_turn % 2:
+            urls = list(reversed(urls))
+        self._rpc_turn += 1
+        return urls
+
+    async def _rpc_once(self, client, rpc_url, method, params):
+        """One RPC post. Returns body, error, and Retry-After seconds when present."""
+        try:
+            response = await client.post(
+                rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=20,
+            )
+        except Exception as exc:
+            name = exc.__class__.__name__
+            if "timeout" in name.lower():
+                return None, "timeout", None
+            return None, name, None
+        retry_after = None
+        header = response.headers.get("Retry-After") if response.headers else None
+        if header:
+            try:
+                retry_after = max(1, int(float(header)))
+            except (TypeError, ValueError):
+                retry_after = None
+        if response.status_code == 429:
+            return None, "rpc 429", retry_after
+        if response.status_code in (401, 403):
+            return None, "rpc refused", None
+        if response.status_code >= 400:
+            return None, f"rpc http {response.status_code}", None
+        try:
+            body = response.json()
+        except ValueError:
+            return None, "rpc report", None
+        if isinstance(body, dict) and body.get("error"):
+            message = body["error"].get("message", "") if isinstance(body["error"], dict) else ""
+            lowered = str(message).lower()
+            if "not allowed" in lowered or "excluded" in lowered or "forbidden" in lowered:
+                return None, "rpc refused", None
+            return None, "rpc error", None
+        if isinstance(body, dict):
+            return body, None, None
+        return None, "rpc report", None
+
+    async def _paced_rpc(self, client, primary, method, params, retries):
+        """One early-buyer call at a time. Rotate the two public RPCs and back off."""
+        async with self._lock():
+            urls = self._rotate(primary)
+            last = "rpc unavailable"
+            rounds = max(1, int(retries))
+            for round_index in range(rounds):
+                wait = None
+                refused = None
+                for url in urls:
+                    await self._sleep(_RPC_GAP_S)
+                    body, error, retry_after = await self._rpc_once(client, url, method, params)
+                    if body is not None:
+                        return body, None
+                    if error == "rpc refused":
+                        refused = error
+                        continue
+                    last = error or last
+                    if retry_after:
+                        wait = retry_after if wait is None else max(wait, retry_after)
+                if refused and last == "rpc unavailable":
+                    return None, refused
+                if round_index + 1 >= rounds:
+                    break
+                delay = wait if wait is not None else min(8, 2 ** round_index)
+                await self._sleep(max(1, delay))
+            return None, last
+
+    def _remember_pages(self, address: str, collected: list, before: str | None, done: bool) -> None:
+        if not collected and not done:
+            return
+        auditcache.store_pages(address, collected, before, done)
+
     async def _signature_pages(self, client, rpc_url, address, retries):
+        saved = auditcache.load_pages(address)
         collected = []
         before = None
         seen = set()
+        if saved:
+            collected = [row for row in saved.get("signatures") or [] if isinstance(row, dict)]
+            if saved.get("done"):
+                return collected, None, False
+            before = saved.get("before") if isinstance(saved.get("before"), str) else None
+            if before:
+                seen.add(before)
         while True:
             options = {"limit": 1000}
             if before:
                 options["before"] = before
-            body, error = await self._rpc_across(
-                rpc_url, "getSignaturesForAddress", [address, options], client, retries
+            body, error = await self._paced_rpc(
+                client, rpc_url, "getSignaturesForAddress", [address, options], retries
             )
             if body is None:
+                self._remember_pages(address, collected, before, False)
                 return None, error or "rpc unavailable", False
             result = body.get("result")
             if not isinstance(result, list):
+                self._remember_pages(address, collected, before, False)
                 return None, "signatures missing", False
             collected.extend(item for item in result if isinstance(item, dict))
             if len(result) < 1000:
+                self._remember_pages(address, collected, before, True)
                 return collected, None, False
             last = result[-1].get("signature") if isinstance(result[-1], dict) else None
             if not last or last in seen:
+                self._remember_pages(address, collected, before, False)
                 return collected, None, True
             seen.add(last)
             before = last
+            self._remember_pages(address, collected, before, False)
 
     async def _early_bundle(self, client, rpc_url, pool, mint, retries):
         """Same-slot buyers, and buyers funded inside the same transaction.
 
         Used only when RugCheck has not built an insider network. A partial
-        or unread window is not a measurement.
+        or unread window is not a measurement. One desk holds the pool while
+        it pages, and a later try continues from the saved pages.
         """
         address = _solana_address(pool) or _solana_address(mint)
         if not address:
             return None, "pool missing"
+        held = False
+        waited = 0.0
+        while not held and waited < 20:
+            held = auditcache.acquire(address)
+            if held:
+                break
+            await self._sleep(0.5)
+            waited += 0.5
+            cached = auditcache.load_layer(mint, 7)
+            if isinstance(cached, dict) and isinstance(cached.get("bundle_size"), int) and not isinstance(
+                cached.get("bundle_size"), bool
+            ):
+                return cached["bundle_size"], None
+        try:
+            return await self._read_early(client, rpc_url, address, mint, retries)
+        finally:
+            if held:
+                auditcache.release(address)
+
+    async def _read_early(self, client, rpc_url, address, mint, retries):
         signatures, error, truncated = await self._signature_pages(client, rpc_url, address, retries)
         if signatures is None:
             return None, error or "rpc unavailable"
@@ -765,11 +1091,11 @@ class Auditor:
         usable.sort(key=lambda row: (row.get("slot") or 0, row.get("transactionIndex") or 0))
         events = []
         for row in usable[:40]:
-            body, tx_error = await self._rpc_across(
+            body, tx_error = await self._paced_rpc(
+                client,
                 rpc_url,
                 "getTransaction",
                 [row["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}],
-                client,
                 retries,
             )
             result = body.get("result") if isinstance(body, dict) else None
