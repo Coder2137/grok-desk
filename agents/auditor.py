@@ -7,16 +7,19 @@ import httpx
 from config import iso, parse_iso, utc_now
 from fields import (
     MISSING,
+    buyers_from_transaction,
+    early_slot_bundle_size,
+    funder_from_transaction,
     graph_nodes_links,
     insider_bundle_size,
-    program_account_rows,
+    permanent_delegate_from_mint,
     rpc_mint_account,
     rpc_supply_ui,
     rug_lp,
     token_account_fields,
 )
 from logutil import file_logger, log
-from sources import TOKEN_2022, TOKEN_PROGRAM, RpcRefused, rpc, rug_graph, rug_report
+from sources import TOKEN_2022, TOKEN_PROGRAM, RpcRefused, rpc, rpc_urls, rug_graph, rug_report
 
 LOG = file_logger("auditor", "auditor.log")
 HEARTBEAT_S = 30
@@ -92,6 +95,15 @@ def biggest_bundle(nodes, links) -> int:
         root = find(item)
         sizes[root] = sizes.get(root, 0) + 1
     return max(sizes.values())
+
+
+def _solana_address(value) -> str | None:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    if not isinstance(value, str) or not (32 <= len(value) <= 44):
+        return None
+    if any(ch not in alphabet for ch in value):
+        return None
+    return value
 
 
 def short_addr(value: str) -> str:
@@ -315,12 +327,23 @@ def audit_from_facts(facts: dict) -> dict:
     layers.append(_layer(7, True, "None" if size <= 1 else str(size), "rugcheck"))
 
     # 8 delegations
-    if facts.get("delegations_down") or facts.get("delegation_accounts") is None:
+    accounts = facts.get("delegation_accounts")
+    if facts.get("delegations_down") or accounts is None or accounts == []:
         cause = facts.get("delegations_error") or "missing"
         value = f"no data: delegations ({cause})"
         layers.append(_layer(8, False, value, "rpc"))
         return finish(False, value, 8)
-    accounts = facts.get("delegation_accounts")
+    if any(row.get("read") is False for row in accounts):
+        value = "no data: delegations (account not found)"
+        layers.append(_layer(8, False, value, "rpc"))
+        return finish(False, value, 8)
+    permanent = facts.get("permanent_delegate")
+    if not permanent:
+        permanent = next((row.get("permanent_delegate") for row in accounts if row.get("permanent_delegate")), None)
+    if permanent:
+        value = f"permanent delegate {short_addr(permanent)}"
+        layers.append(_layer(8, False, value, "rpc"))
+        return finish(False, value, 8)
     holders = sum(1 for row in accounts if (row.get("balance") or 0) > 0)
     counts: dict[str, int] = {}
     for row in accounts:
@@ -447,6 +470,13 @@ class Auditor:
                     top10_error = None
             accounts, delegations_error = await self._delegations(rpc_url, mint, client, retries)
             delegations_down = False
+            bundle_size, bundle_error = insider_bundle_size(graph, report if isinstance(report, dict) else None)
+            if bundle_size is None:
+                measured, measured_error = await self._early_bundle(client, rpc_url, pool, mint, retries)
+                if measured is not None:
+                    bundle_size, bundle_error = measured, None
+                else:
+                    bundle_error = measured_error or bundle_error or "missing"
         mint_account = rpc_mint_account(mint_resp) if mint_resp else {
             "mintAuthority": MISSING,
             "freezeAuthority": MISSING,
@@ -454,12 +484,11 @@ class Auditor:
             "decimals": None,
         }
         nodes, links, links_missing, empty_network = graph_nodes_links(graph)
-        bundle_size, bundle_error = insider_bundle_size(graph, report if isinstance(report, dict) else None)
-        if bundle_size is None and not bundle_error:
-            bundle_error = "missing"
         if bundle_size is not None:
             links_missing = False
             empty_network = False
+        elif not bundle_error:
+            bundle_error = "missing"
         pool_for_lp = message.get("pool") or (coin["pool"] if coin else None)
         lp = rug_lp(report or {}, pool_for_lp)
         if report is None:
@@ -504,6 +533,7 @@ class Auditor:
             "empty_network": empty_network,
             "delegations_down": delegations_down,
             "delegation_accounts": accounts,
+            "permanent_delegate": permanent_delegate_from_mint(mint_resp),
         }
 
     async def _creator_balance(self, client, rpc_url, creator, mint, rug_fields, retries):
@@ -644,28 +674,108 @@ class Auditor:
         )
         value = None
         if isinstance(parsed, dict):
-            value = parsed.get("result", {}).get("value") if isinstance(parsed.get("result"), dict) else None
+            result = parsed.get("result")
+            value = result.get("value") if isinstance(result, dict) else None
+            if result is None and "result" in parsed:
+                return None, "account not found"
         if not isinstance(value, list):
             return None, error or "largest accounts missing"
+        if any(item is None for item in value):
+            return None, "account not found"
         out = []
         for address, account in zip(addresses, value):
             wrapped = {"account": account} if isinstance(account, dict) else {}
             fields = token_account_fields(wrapped)
             fields["address"] = address
+            if not fields.get("read"):
+                return None, "account not found"
             out.append(fields)
+        if not out:
+            return None, "account not found"
         return out, None
 
-    async def _delegations(self, rpc_url, mint, client, retries):
-        """Delegates on token accounts. Both programs are read.
+    async def _signature_pages(self, client, rpc_url, address, retries):
+        collected = []
+        before = None
+        for _page in range(8):
+            options = {"limit": 1000}
+            if before:
+                options["before"] = before
+            body, error = await self._rpc_call(
+                client, rpc_url, "getSignaturesForAddress", [address, options], retries
+            )
+            if body is None:
+                return None, error or "rpc unavailable", False
+            result = body.get("result")
+            if not isinstance(result, list):
+                return None, "signatures missing", False
+            collected.extend(item for item in result if isinstance(item, dict))
+            if len(result) < 1000:
+                return collected, None, False
+            last = result[-1]
+            before = last.get("signature") if isinstance(last, dict) else None
+            if not before:
+                return None, "signatures missing", False
+        return collected, None, True
 
-        getProgramAccounts puts rows on result, and the classic program is an
-        empty list for a Token-2022 mint. That empty list must not hide the
-        Token-2022 accounts. When the scan does not answer, the largest
-        accounts' parsed delegate fields are the fallback.
+    async def _early_bundle(self, client, rpc_url, pool, mint, retries):
+        """Same-slot buyers, and buyers funded inside the same transaction.
+
+        Used only when RugCheck has not built an insider network. A partial
+        or unread window is not a measurement.
         """
+        address = _solana_address(pool) or _solana_address(mint)
+        if not address:
+            return None, "pool missing"
+        signatures, error, truncated = await self._signature_pages(client, rpc_url, address, retries)
+        if signatures is None:
+            return None, error or "rpc unavailable"
+        if not signatures:
+            return None, "no signatures"
+        if truncated:
+            return None, "early window incomplete"
+        usable = [
+            row for row in signatures
+            if isinstance(row, dict) and row.get("signature") and not row.get("err")
+        ]
+        if not usable:
+            return None, "early buys missing"
+        usable.sort(key=lambda row: (row.get("slot") or 0, row.get("transactionIndex") or 0))
+        events = []
+        for row in usable[:40]:
+            body, tx_error = await self._rpc_call(
+                client,
+                rpc_url,
+                "getTransaction",
+                [row["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}],
+                retries,
+            )
+            result = body.get("result") if isinstance(body, dict) else None
+            buyers = buyers_from_transaction(result, mint, address) if isinstance(result, dict) else None
+            if buyers is None:
+                return None, tx_error or "tx missing"
+            events.append(
+                {
+                    "slot": row.get("slot"),
+                    "buyers": buyers,
+                    "funder": funder_from_transaction(result, buyers),
+                }
+            )
+        return early_slot_bundle_size(events)
+
+    def _prefer_rpc_error(self, errors: list[str]) -> str:
+        for error in errors:
+            if error == "rpc 429":
+                return error
+        for error in errors:
+            if error and error != "account not found":
+                return error
+        return "account not found"
+
+    async def _program_holders(self, rpc_url, mint, client, retries):
         rows = []
         errors = []
-        answered = False
+        answered = 0
         for program in (TOKEN_PROGRAM, TOKEN_2022):
             body, error = await self._rpc_call(
                 client,
@@ -683,18 +793,60 @@ class Auditor:
             if body is None:
                 errors.append(error or "rpc unavailable")
                 continue
-            parsed = program_account_rows(body)
-            if parsed is None:
-                errors.append(error or "accounts missing")
+            result = body.get("result")
+            if isinstance(result, dict) and isinstance(result.get("value"), list):
+                items = result["value"]
+            elif isinstance(result, list):
+                items = result
+            else:
+                errors.append("accounts missing")
                 continue
-            answered = True
+            if any(item is None or not isinstance(item, dict) for item in items):
+                return None, "account not found"
+            parsed = []
+            for item in items:
+                fields = token_account_fields(item)
+                if not fields.get("read"):
+                    return None, "account not found"
+                parsed.append(fields)
+            answered += 1
             rows.extend(parsed)
-        if rows or (answered and not errors):
+        if rows:
             return rows, None
-        largest, largest_error = await self._largest(rpc_url, mint, client, retries)
-        if largest is not None:
-            return largest, None
-        return None, (errors[0] if errors else largest_error or "accounts missing")
+        if answered and not errors:
+            return None, "account not found"
+        return None, self._prefer_rpc_error(errors)
+
+    async def _delegations(self, rpc_url, mint, client, retries):
+        """Delegates on holder accounts, from either token program.
+
+        A Token-2022 mint has an empty classic-program list. That empty list
+        is not a failed read and must not hide the Token-2022 accounts. When
+        one RPC fails, the other public endpoint is tried, then the largest
+        accounts. An unread or null account is account not found, not a pass.
+        """
+        errors = []
+        saw_not_found = False
+        for url in rpc_urls(rpc_url):
+            rows, error = await self._program_holders(url, mint, client, retries)
+            if rows:
+                return rows, None
+            if error == "account not found":
+                saw_not_found = True
+                continue
+            if error:
+                errors.append(error)
+        for url in rpc_urls(rpc_url):
+            rows, error = await self._largest(url, mint, client, retries)
+            if rows:
+                return rows, None
+            if error == "account not found":
+                return None, "account not found"
+            if error:
+                errors.append(error)
+        if saw_not_found and not any(error.startswith("rpc") for error in errors):
+            return None, "account not found"
+        return None, self._prefer_rpc_error(errors) if errors else "account not found"
 
 
 def _sum_owner_balance(response) -> float | None:

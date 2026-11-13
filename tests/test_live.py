@@ -298,6 +298,8 @@ class _Api:
                 self.blob_posts.append(content)
             return httpx.Response(201, json={"sha": git_blob_sha(content)})
         if request.method == "POST" and rest == "/git/trees":
+            if getattr(self, "reject_large_trees", False) and len(body.get("tree") or []) > _TREE_CHUNK:
+                return httpx.Response(422, json={"message": "The tree was too large to upload in one go"})
             self.tree_posts.append(body)
             merged = {}
             if body.get("base_tree"):
@@ -761,21 +763,24 @@ def test_catch_up_of_1068_files_chunks_trees_and_posts_no_blobs(tmp_path):
     api = _Api()
     github = _github(api)
     try:
+        api.reject_large_trees = True
         assert publish(root, github) == "updated"
         assert api.blob_posts == []
         content = [body for body in api.tree_posts if any("content" in entry for entry in body["tree"])]
         sha_only = [body for body in api.tree_posts if body not in content]
-        assert len(content) <= 8
         assert len(content) == 8
         assert sum(len(body["tree"]) for body in content) == 1068
         assert all(len(body["tree"]) <= _TREE_CHUNK for body in content)
         assert "base_tree" not in content[0]
         for index in range(1, len(content)):
             assert content[index]["base_tree"] == api.created_trees[index - 1]
-        assert len(sha_only) == 1
+        assert len(sha_only) == 8
         assert sha_only[0]["base_tree"] == "maintree"
-        assert len(sha_only[0]["tree"]) == 1068
-        assert all("content" not in entry and entry.get("sha") for entry in sha_only[0]["tree"])
+        assert sum(len(body["tree"]) for body in sha_only) == 1068
+        assert all(len(body["tree"]) <= _TREE_CHUNK for body in sha_only)
+        assert all("content" not in entry and entry.get("sha") for body in sha_only for entry in body["tree"])
+        for index in range(1, len(sha_only)):
+            assert sha_only[index]["base_tree"] == api.created_trees[len(content) + index - 1]
         assert "publish-backoff-until" not in load_live_files(root)
         live_tree = api.commits[api.ref]["tree"]
         pages_tree = api.commits[api.pages_ref]["tree"]
@@ -791,9 +796,36 @@ def test_catch_up_of_1068_files_chunks_trees_and_posts_no_blobs(tmp_path):
         assert again[0]["base_tree"] == live_tree
         for index in range(1, len(again)):
             assert again[index]["base_tree"] == api.created_trees[index - 1]
-        assert len(sha_again) == 1
+        assert len(sha_again) == 8
         assert sha_again[0]["base_tree"] == pages_tree
-        assert all("content" not in entry for entry in sha_again[0]["tree"])
+        assert sum(len(body["tree"]) for body in sha_again) == 1068
+        assert all(len(body["tree"]) <= _TREE_CHUNK for body in sha_again)
+        assert all("content" not in entry for body in sha_again for entry in body["tree"])
+        pages_paths = [item["path"] for item in api.trees[api.commits[api.pages_ref]["tree"]]]
+        assert sum(1 for path in pages_paths if path.startswith("web/live/coin/")) == 1065
+    finally:
+        github.close()
+
+
+def test_a_published_coin_stays_when_it_is_absent_from_the_next_snapshot(tmp_path):
+    root = tmp_path / "live"
+    _envelopes(root)
+    api = _Api()
+    github = _github(api)
+    try:
+        assert publish(root, github) == "updated"
+        extra = git_blob_sha(b'{"v":1,"alg":"AES-256-GCM","n":"oldcoin","c":"old"}')
+        pages_tree = api.commits[api.pages_ref]["tree"]
+        api.trees[pages_tree].append(
+            {"path": "web/live/coin/OldCoin.json", "mode": "100644", "type": "blob", "sha": extra}
+        )
+        (root / "state.json").write_bytes(
+            envelope_bytes(encrypt_envelope(b'{"balance":2}', FIXTURE_DATA_PATH, "state.json", nonce=bytes(range(12))))
+        )
+        assert publish(root, github) == "updated"
+        site = {item["path"]: item["sha"] for item in api.trees[api.commits[api.pages_ref]["tree"]]}
+        assert site["web/live/coin/OldCoin.json"] == extra
+        assert site["web/live/coin/Mint111.json"] == git_blob_sha((root / "coin" / "Mint111.json").read_bytes())
     finally:
         github.close()
 
