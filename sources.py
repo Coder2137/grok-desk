@@ -10,6 +10,18 @@ RUG_REPORT = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
 RUG_GRAPH = "https://api.rugcheck.xyz/v1/tokens/{mint}/insiders/graph"
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
+FALLBACK_RPC = "https://solana.api.onfinality.io/public"
+
+
+def rpc_urls(primary: str | None) -> list[str]:
+    """The desk RPC, then one public endpoint if that call fails."""
+    urls = []
+    for url in (primary, FALLBACK_RPC, PUBLIC_RPC):
+        if isinstance(url, str) and url.startswith("https://") and url not in urls:
+            urls.append(url)
+    return urls[:2]
+
 
 _DEX_TIMES: deque[float] = deque()
 
