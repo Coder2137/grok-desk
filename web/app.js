@@ -57,6 +57,18 @@
     return localStorage.getItem("deskDataPath") || "";
   }
 
+  async function pullCoin(mint) {
+    const safe = encodeURIComponent(mint);
+    if (mint && mint.length >= 1) {
+      try {
+        return await pull("coin/" + encodeURIComponent(mint.slice(0, 1)) + "/" + safe + ".json");
+      } catch (err) {
+        return await pull("coin/" + safe + ".json");
+      }
+    }
+    return pull("coin/" + safe + ".json");
+  }
+
   async function pull(file) {
     const dataPath = capturePath();
     if (!dataPath) throw new Error("missing");
@@ -111,7 +123,7 @@
       state.retry = 15;
       if ((state.screen === "coin" || state.screen === "auditor") && state.coinMint) {
         try {
-          state.coin = await pull("coin/" + encodeURIComponent(state.coinMint) + ".json");
+          state.coin = await pullCoin(state.coinMint);
         } catch (err) {
           const known = ((state.data && state.data.coins) || []).find((coin) => coin.mint === state.coinMint);
           if (!state.coin || state.coin.mint !== state.coinMint) {

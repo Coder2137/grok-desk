@@ -45,6 +45,8 @@ _BLOB_LIMIT = 40
 _BLOB_WORKERS = 4
 # ~150 inline files per tree POST. 1068 changed files is 8 requests, then one commit and a ref update.
 _TREE_CHUNK = 150
+# One git directory of coin files above this is sharded by the first character.
+_DIR_LIMIT = 80
 _RATE_LIMIT_S = 600
 _CORE = ("state.json", "chart.json", "activity.json")
 _SECRET_ENV = (
@@ -223,11 +225,64 @@ def _reject_secret_material(files: dict[str, bytes]) -> None:
                 raise PublishError("refusing to publish a live file that contains a secret")
 
 
+def _flat_coin_dir(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) == 2 and parts[0] == "coin" and parts[1].endswith(".json"):
+        return ""
+    if len(parts) == 3 and parts[0] in ("desk2", "desk3") and parts[1] == "coin" and parts[2].endswith(".json"):
+        return parts[0]
+    return None
+
+
+def _wide_coin_dirs(files: dict[str, bytes]) -> set[str]:
+    counts: dict[str, int] = {}
+    for path in files:
+        desk = _flat_coin_dir(path)
+        if desk is None:
+            continue
+        counts[desk] = counts.get(desk, 0) + 1
+    return {desk for desk, count in counts.items() if count > _DIR_LIMIT}
+
+
+def layout_files(files: dict[str, bytes]) -> dict[str, bytes]:
+    """Move a crowded coin directory under coin/<first letter>/ so no git tree is huge.
+
+    The ciphertext is unchanged. The phone decrypts it with the original coin/name.json path.
+    """
+    wide = _wide_coin_dirs(files)
+    if not wide:
+        return files
+    laid: dict[str, bytes] = {}
+    for path, content in files.items():
+        desk = _flat_coin_dir(path)
+        if desk not in wide:
+            laid[path] = content
+            continue
+        name = path.rsplit("/", 1)[-1]
+        letter = name[:1] or "_"
+        prefix = f"{desk}/coin/{letter}" if desk else f"coin/{letter}"
+        laid[f"{prefix}/{name}"] = content
+    return laid
+
+
+def logical_coin_path(path: str) -> str | None:
+    """coin/A/Name.json and coin/Name.json both mean the coin file Name.json."""
+    parts = path.split("/")
+    if parts and parts[0] == "web" and len(parts) > 2 and parts[1] == "live":
+        parts = parts[2:]
+    if len(parts) >= 2 and parts[0] == "coin" and parts[-1].endswith(".json"):
+        return f"coin/{parts[-1]}"
+    if len(parts) >= 3 and parts[0] in ("desk2", "desk3") and parts[1] == "coin" and parts[-1].endswith(".json"):
+        return f"{parts[0]}/coin/{parts[-1]}"
+    return None
+
+
 def same_files(files: dict[str, bytes], remote: dict[str, str] | None, truncated: bool) -> bool:
     if remote is None or truncated:
         return False
     # Extra files on the branch are kept. A publish is due only when a local file is new or its blob changed.
-    return all(remote.get(path) == git_blob_sha(content) for path, content in files.items())
+    laid = layout_files(files)
+    return all(remote.get(path) == git_blob_sha(content) for path, content in laid.items())
 
 
 class GitHub:
@@ -422,11 +477,21 @@ class GitHub:
         with ThreadPoolExecutor(max_workers=_BLOB_WORKERS) as pool:
             return list(pool.map(upload, pending))
 
-    def _post_tree(self, entries: list[dict], base_tree: str | None) -> str:
+    def _post_tree_raw(self, entries: list[dict], base_tree: str | None) -> str:
         body: dict = {"tree": entries}
         if base_tree:
             body["base_tree"] = base_tree
         return self.request("POST", f"/repos/{self.repo}/git/trees", body).json()["sha"]
+
+    def _post_tree(self, entries: list[dict], base_tree: str | None) -> str:
+        try:
+            return self._post_tree_raw(entries, base_tree)
+        except GitHubError as exc:
+            if exc.status in (422, 502) and len(entries) > 1:
+                mid = len(entries) // 2
+                left = self._post_tree(entries[:mid], base_tree)
+                return self._post_tree(entries[mid:], left)
+            raise
 
     def _post_tree_chunks(self, entries: list[dict], base_tree: str | None) -> str:
         """Chain tree posts so one snapshot is never a single oversized request.
@@ -507,7 +572,68 @@ class GitHub:
             tree_sha = self._post_tree(self._blob_entries(pending), base_tree)
         return self._finish_commit(branch, message, tree_sha, parents, existed)
 
+    def _build_tree(self, mapping: dict[str, str]) -> str:
+        """Create nested git trees. Each request stays within _TREE_CHUNK entries."""
+        root: dict = {}
+        for path, sha in mapping.items():
+            node = root
+            parts = path.split("/")
+            for part in parts[:-1]:
+                child = node.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    node[part] = child
+                node = child
+            node[parts[-1]] = sha
+
+        def build(node: dict) -> str:
+            entries = []
+            for name in sorted(node):
+                value = node[name]
+                if isinstance(value, dict):
+                    entries.append({"path": name, "mode": "040000", "type": "tree", "sha": build(value)})
+                else:
+                    entries.append({"path": name, "mode": "100644", "type": "blob", "sha": value})
+            return self._post_tree_chunks(entries, None)
+
+        return build(root)
+
+    def _mapping(self, laid: dict[str, bytes], remote: dict[str, str]) -> dict[str, str]:
+        known = set(remote.values())
+        local_logical = {logical_coin_path(path) or path for path in laid}
+        mapping: dict[str, str] = {}
+        uploads: list[tuple[str, bytes]] = []
+        for path, content in laid.items():
+            digest = git_blob_sha(content)
+            if digest in known:
+                mapping[path] = digest
+            else:
+                uploads.append((path, content))
+        for entry in self._blob_entries(uploads):
+            mapping[entry["path"]] = entry["sha"]
+        for remote_path, sha in remote.items():
+            logical = logical_coin_path(remote_path)
+            if logical is None or logical in local_logical:
+                continue
+            name = remote_path.rsplit("/", 1)[-1]
+            letter = name[:1] or "_"
+            desk = remote_path.split("/")[0] if remote_path.startswith(("desk2/", "desk3/")) else ""
+            if remote_path.startswith("web/live/"):
+                rest = remote_path[len("web/live/") :]
+                desk = rest.split("/")[0] if rest.startswith(("desk2/", "desk3/")) else ""
+            published = f"{desk}/coin/{letter}/{name}" if desk else f"coin/{letter}/{name}"
+            mapping.setdefault(published, sha)
+        return mapping
+
+    def _commit_wide(self, branch: str, message: str, files: dict[str, bytes]) -> str:
+        status, parents, _base_tree, remote = self._tip_context(branch, None)
+        mapping = self._mapping(layout_files(files), remote)
+        tree_sha = self._build_tree(mapping)
+        return self._finish_commit(branch, message, tree_sha, parents, status != 404)
+
     def commit_files(self, branch: str, files: dict[str, bytes], message: str) -> str:
+        if _wide_coin_dirs(files):
+            return self._commit_wide(branch, message, files)
         return self._commit_tree(branch, message, files, catch_up=True)
 
     def _live_sha_entries(self, files: dict[str, bytes]) -> list[dict]:
@@ -531,6 +657,25 @@ class GitHub:
         main has not moved, only changed web/live blobs are sent. No dispatch.
         """
         pages_tip = self.branch_tip(PAGES_BRANCH)
+        if _wide_coin_dirs(files):
+            live_tip = self.branch_tip(LIVE_BRANCH)
+            if not live_tip:
+                raise PublishError("live branch was not found")
+            live_tree = self.request("GET", f"/repos/{self.repo}/git/commits/{live_tip}").json()["tree"]["sha"]
+            if rebuild_from_main or not pages_tip:
+                if not main_tip:
+                    raise PublishError("main branch was not found")
+                base_tree = self.request("GET", f"/repos/{self.repo}/git/commits/{main_tip}").json()["tree"]["sha"]
+                parents = [pages_tip or main_tip]
+                existed = pages_tip is not None
+            else:
+                _status, parents, base_tree, _remote = self._tip_context(PAGES_BRANCH, None)
+                existed = True
+            tree_sha = self._post_tree(
+                [{"path": "web/live", "mode": "040000", "type": "tree", "sha": live_tree}],
+                base_tree,
+            )
+            return self._finish_commit(PAGES_BRANCH, f"{PAGES_MESSAGE} {live_sha}", tree_sha, parents, existed)
         if rebuild_from_main or not pages_tip:
             if not main_tip:
                 raise PublishError("main branch was not found")

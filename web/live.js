@@ -49,19 +49,36 @@
     }
   }
 
+  function envelopeName(name) {
+    const parts = name.split("/");
+    if (parts.length === 3 && parts[0] === "coin" && parts[2].endsWith(".json")) {
+      return "coin/" + parts[2];
+    }
+    if (
+      parts.length === 4 &&
+      (parts[0] === "desk2" || parts[0] === "desk3") &&
+      parts[1] === "coin" &&
+      parts[3].endsWith(".json")
+    ) {
+      return parts[0] + "/coin/" + parts[3];
+    }
+    return name;
+  }
+
   async function loadDeskFile(file, options) {
     const settings = options || {};
     const dataPath = settings.dataPath || "";
     if (!dataPath) throw new Error("missing");
-    const name = relativeName(file);
+    const name = envelopeName(relativeName(file));
     const fetchImpl = settings.fetchImpl || fetch;
     const pageUrl = settings.pageUrl || (typeof location !== "undefined" ? location.href : "");
     const base = new URL(".", pageUrl);
-    const plainUrl = new URL("d/" + encodeURIComponent(dataPath) + "/" + encodedPath(name), base);
+    const stored = relativeName(file);
+    const plainUrl = new URL("d/" + encodeURIComponent(dataPath) + "/" + encodedPath(stored), base);
     const plain = await fetchImpl(plainUrl, { cache: "no-store" });
     if (plain.ok) return plain.json();
     if (plain.status !== 404) throw new Error(String(plain.status));
-    const liveUrl = new URL("live/" + encodedPath(name), base);
+    const liveUrl = new URL("live/" + encodedPath(stored), base);
     const live = await fetchImpl(liveUrl, { cache: "no-store" });
     if (!live.ok) throw new Error(String(live.status));
     return decryptLiveEnvelope(await live.json(), dataPath, name);
