@@ -428,6 +428,19 @@ class GitHub:
             body["base_tree"] = base_tree
         return self.request("POST", f"/repos/{self.repo}/git/trees", body).json()["sha"]
 
+    def _post_tree_chunks(self, entries: list[dict], base_tree: str | None) -> str:
+        """Chain tree posts so one snapshot is never a single oversized request.
+
+        Entries are blob shas, not file bodies. Each post keeps the previous
+        tree, so coin files from earlier batches stay published.
+        """
+        if not entries:
+            return base_tree or ""
+        tree_sha = base_tree
+        for start in range(0, len(entries), _TREE_CHUNK):
+            tree_sha = self._post_tree(entries[start : start + _TREE_CHUNK], tree_sha)
+        return tree_sha or ""
+
     def _inline_tree(self, pending: list[tuple[str, bytes]], base_tree: str | None) -> str:
         tree_sha = base_tree
         for start in range(0, len(pending), _TREE_CHUNK):
@@ -522,7 +535,7 @@ class GitHub:
             if not main_tip:
                 raise PublishError("main branch was not found")
             main_commit = self.request("GET", f"/repos/{self.repo}/git/commits/{main_tip}").json()
-            tree_sha = self._post_tree(self._live_sha_entries(files), main_commit["tree"]["sha"])
+            tree_sha = self._post_tree_chunks(self._live_sha_entries(files), main_commit["tree"]["sha"])
             return self._finish_commit(
                 PAGES_BRANCH,
                 f"{PAGES_MESSAGE} {live_sha}",
@@ -547,7 +560,7 @@ class GitHub:
                 }
                 for path, content in pending
             ]
-            tree_sha = self._post_tree(entries, base_tree)
+            tree_sha = self._post_tree_chunks(entries, base_tree)
         else:
             tree_sha = self._post_tree(self._blob_entries(pending), base_tree)
         return self._finish_commit(PAGES_BRANCH, f"{PAGES_MESSAGE} {live_sha}", tree_sha, parents, existed)
