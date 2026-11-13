@@ -127,7 +127,14 @@ def test_program_accounts_result_list_is_not_accounts_missing():
             ]
         }
     )
-    assert rows == [{"mint": MINT, "owner": "Holder", "balance": 5.0, "delegate": "Delegate"}]
+    assert rows == [{
+        "mint": MINT,
+        "owner": "Holder",
+        "balance": 5.0,
+        "delegate": "Delegate",
+        "permanent_delegate": None,
+        "read": True,
+    }]
     assert program_account_rows({"result": []}) == []
     assert program_account_rows({"result": {"value": []}}) == []
 

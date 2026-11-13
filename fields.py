@@ -444,31 +444,54 @@ def rpc_supply_ui(mint_account: dict):
         return None
 
 
+def _info_delegates(info: dict) -> tuple:
+    delegate = pick(info, "delegate")
+    permanent = None
+    extensions = info.get("extensions") if isinstance(info, dict) else None
+    if isinstance(extensions, list):
+        for ext in extensions:
+            if not isinstance(ext, dict) or ext.get("extension") != "permanentDelegate":
+                continue
+            state = ext.get("state") if isinstance(ext.get("state"), dict) else ext
+            candidate = state.get("delegate") if isinstance(state, dict) else None
+            if isinstance(candidate, str) and candidate:
+                permanent = candidate
+    return delegate, permanent
+
+
 def token_account_fields(account_obj) -> dict:
-    """Mapped token-account keys. Delegate may be absent -> null."""
+    """Mapped token-account keys. A missing account is not a null delegate."""
     if not isinstance(account_obj, dict):
         account_obj = {}
     info = pick(account_obj, "account.data.parsed.info")
     if not isinstance(info, dict):
         info = account_obj if "mint" in account_obj or "tokenAmount" in account_obj else {}
-        base = info
-        mint = pick(base, "mint")
-        owner = pick(base, "owner")
-        balance = pick(base, "tokenAmount.uiAmount")
-        if balance is MISSING:
-            balance = pick(base, "uiAmount")
-        delegate = pick(base, "delegate")
-    else:
-        mint = pick(info, "mint")
-        owner = pick(info, "owner")
-        balance = pick(info, "tokenAmount.uiAmount")
-        delegate = pick(info, "delegate")
+    read = isinstance(info, dict) and any(key in info for key in ("mint", "owner", "tokenAmount"))
+    if not isinstance(info, dict):
+        info = {}
+    mint = pick(info, "mint")
+    owner = pick(info, "owner")
+    balance = pick(info, "tokenAmount.uiAmount")
+    if balance is MISSING:
+        balance = pick(info, "uiAmount")
+    delegate, permanent = _info_delegates(info)
     return {
         "mint": as_text(mint),
         "owner": as_text(owner),
         "balance": as_float(balance),
         "delegate": None if delegate is MISSING or delegate is None else as_text(delegate),
+        "permanent_delegate": permanent,
+        "read": read,
     }
+
+
+def permanent_delegate_from_mint(response) -> str | None:
+    """Token-2022 permanentDelegate lives on the mint, not on each holder."""
+    info = pick(response, "result.value.data.parsed.info")
+    if not isinstance(info, dict):
+        return None
+    _delegate, permanent = _info_delegates(info)
+    return permanent
 
 
 def largest_account_rows(response) -> list | None:
