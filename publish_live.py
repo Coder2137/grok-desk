@@ -47,7 +47,11 @@ _BLOB_WORKERS = 4
 _TREE_CHUNK = 150
 # One git directory of coin files above this is sharded by the first character.
 _DIR_LIMIT = 80
+# Tree writes per process. The next loop resumes from var/publish-progress.json.
+_WRITE_BUDGET = 20
+_WRITE_GAP_S = 0.05
 _RATE_LIMIT_S = 600
+_PROGRESS_NAME = "publish-progress.json"
 _CORE = ("state.json", "chart.json", "activity.json")
 _SECRET_ENV = (
     "DATA_PATH",
@@ -159,6 +163,49 @@ def arm_backoff(root: Path, wait_s: int) -> None:
     path = backoff_marker(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(int(time.time()) + max(1, int(wait_s))), encoding="utf-8")
+
+
+def progress_path(root: Path) -> Path:
+    """Sibling of the live root. Not .plain-hashes.json and not a published file."""
+    return Path(root).parent / _PROGRESS_NAME
+
+
+def load_progress(root: Path) -> dict:
+    try:
+        data = json.loads(progress_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"v": 1, "dirs": {}, "blobs": {}}
+    if not isinstance(data, dict) or data.get("v") != 1:
+        return {"v": 1, "dirs": {}, "blobs": {}}
+    dirs = data.get("dirs") if isinstance(data.get("dirs"), dict) else {}
+    blobs = data.get("blobs") if isinstance(data.get("blobs"), dict) else {}
+    clean_blobs = {
+        str(path): str(sha)
+        for path, sha in blobs.items()
+        if isinstance(path, str) and isinstance(sha, str)
+    }
+    return {"v": 1, "dirs": dict(dirs), "blobs": clean_blobs}
+
+
+def store_progress(root: Path, progress: dict) -> None:
+    path = progress_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "v": 1,
+        "dirs": progress.get("dirs") or {},
+        "blobs": progress.get("blobs") or {},
+    }
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+
+def _core_files(files: dict[str, bytes]) -> dict[str, bytes]:
+    cores = {}
+    for path, content in files.items():
+        name = path.split("/")[-1]
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        if name in _CORE and parent in ("", "desk2", "desk3"):
+            cores[path] = content
+    return cores
 
 
 def _inside(root: Path, path: Path) -> bool:
@@ -290,6 +337,7 @@ class GitHub:
         self.repo = repo
         self._token = token
         self._sleep = sleep or time.sleep
+        self.write_budget = _WRITE_BUDGET
         self._blobs: dict[str, str] = {}
         self._blob_lock = threading.Lock()
         self._owned = client is None
@@ -427,6 +475,7 @@ class GitHub:
             cached = self._blobs.get(digest)
         if cached:
             return cached
+        self._sleep(_WRITE_GAP_S)
         created = self.request(
             "POST",
             f"/repos/{self.repo}/git/blobs",
@@ -443,11 +492,27 @@ class GitHub:
 
     def _read_tree(self, tree_sha: str) -> tuple[dict[str, str], bool]:
         tree = self.request("GET", f"/repos/{self.repo}/git/trees/{tree_sha}?recursive=1").json()
+        if tree.get("truncated"):
+            files: dict[str, str] = {}
+            self._walk_tree(tree_sha, "", files)
+            return files, False
         files = {}
         for item in tree.get("tree") or []:
             if item.get("type") == "blob" and item.get("path"):
                 files[item["path"]] = item["sha"]
-        return files, bool(tree.get("truncated"))
+        return files, False
+
+    def _walk_tree(self, tree_sha: str, prefix: str, files: dict[str, str]) -> None:
+        tree = self.request("GET", f"/repos/{self.repo}/git/trees/{tree_sha}").json()
+        for item in tree.get("tree") or []:
+            name = str(item.get("path") or "")
+            if not name:
+                continue
+            path = f"{prefix}/{name}" if prefix else name
+            if item.get("type") == "tree" and item.get("sha"):
+                self._walk_tree(str(item["sha"]), path, files)
+            elif item.get("type") == "blob" and item.get("sha"):
+                files[path] = str(item["sha"])
 
     def _pending(self, files: dict[str, bytes], remote: dict[str, str], prefix: str = "") -> list[tuple[str, bytes]]:
         pending = []
@@ -478,6 +543,7 @@ class GitHub:
             return list(pool.map(upload, pending))
 
     def _post_tree_raw(self, entries: list[dict], base_tree: str | None) -> str:
+        self._sleep(_WRITE_GAP_S)
         body: dict = {"tree": entries}
         if base_tree:
             body["base_tree"] = base_tree
@@ -625,16 +691,183 @@ class GitHub:
             mapping.setdefault(published, sha)
         return mapping
 
-    def _commit_wide(self, branch: str, message: str, files: dict[str, bytes]) -> str:
-        status, parents, _base_tree, remote = self._tip_context(branch, None)
-        mapping = self._mapping(layout_files(files), remote)
-        tree_sha = self._build_tree(mapping)
-        return self._finish_commit(branch, message, tree_sha, parents, status != 404)
+    def _blob_sha(self, content: bytes, known: set[str]) -> str:
+        """Git blob id. An id already stored on the branch is not uploaded again."""
+        digest = git_blob_sha(content)
+        if digest in known:
+            return digest
+        return self.create_blob(content)
 
-    def commit_files(self, branch: str, files: dict[str, bytes], message: str) -> str:
+    def _resolve_blobs(self, laid: dict[str, bytes], known: set[str], progress: dict, save) -> tuple[dict[str, str], int, bool]:
+        """Map each laid path to a blob id. Upload at most the remaining write budget.
+
+        A blob id already on the branch, or saved from an earlier loop, is not uploaded.
+        """
+        blobs = progress.setdefault("blobs", {})
+        resolved: dict[str, str] = {}
+        writes = 0
+        for path, content in laid.items():
+            digest = git_blob_sha(content)
+            cached = blobs.get(path)
+            with self._blob_lock:
+                remembered = self._blobs.get(digest)
+            if digest in known or cached == digest or remembered:
+                resolved[path] = digest
+                known.add(digest)
+                continue
+            if writes >= self.write_budget:
+                save(progress)
+                return resolved, writes, False
+            try:
+                sha = self.create_blob(content)
+            except RateLimitError:
+                save(progress)
+                raise
+            blobs[path] = sha
+            resolved[path] = sha
+            known.add(sha)
+            writes += 1
+        if writes:
+            save(progress)
+        return resolved, writes, True
+
+    def commit_cores(self, files: dict[str, bytes]) -> str:
+        """Put fresh state/chart/activity on live-data without touching coin files."""
+        cores = _core_files(files)
+        return self._commit_tree(LIVE_BRANCH, COMMIT_MESSAGE, cores, catch_up=False)
+
+    def backfill_coins(self, files: dict[str, bytes], progress: dict, save) -> tuple[str, bool]:
+        """Build letter trees from existing blob ids. A later loop resumes the cache.
+
+        The caller commits core files first. This returns (live tip, settled).
+        Settled means the branch root now points at the sharded tree.
+        """
+        laid = layout_files(files)
+        _status, parents, _base_tree, remote = self._tip_context(LIVE_BRANCH, None)
+        if not parents:
+            raise PublishError("live branch was not found")
+        core_sha = parents[0]
+        known = set(remote.values())
+        progress.setdefault("blobs", {})
+        resolved, writes, blobs_done = self._resolve_blobs(laid, known, progress, save)
+        if not blobs_done:
+            save(progress)
+            return core_sha, False
+        local_logical = {logical_coin_path(path) or path for path in laid}
+        groups: dict[str, list[tuple[str, str]]] = {}
+        loose: dict[str, str] = {}
+        wide = _wide_coin_dirs(files)
+        for path, digest in resolved.items():
+            parts = path.split("/")
+            sharded = (
+                len(parts) == 3 and parts[0] == "coin" and len(parts[1]) == 1
+            ) or (
+                len(parts) == 4 and parts[0] in ("desk2", "desk3") and parts[1] == "coin" and len(parts[2]) == 1
+            )
+            if sharded:
+                groups.setdefault(path.rsplit("/", 1)[0], []).append((parts[-1], digest))
+            else:
+                loose[path] = digest
+        for remote_path, sha in remote.items():
+            logical = logical_coin_path(remote_path)
+            if logical is None or logical in local_logical:
+                continue
+            name = logical.rsplit("/", 1)[-1]
+            letter = name[:1] or "_"
+            desk = ""
+            if logical.startswith("desk2/"):
+                desk = "desk2"
+            elif logical.startswith("desk3/"):
+                desk = "desk3"
+            group = f"{desk}/coin/{letter}" if desk else f"coin/{letter}"
+            if desk in wide:
+                groups.setdefault(group, []).append((name, sha))
+            else:
+                loose.setdefault(logical, sha)
+        dirs = progress.setdefault("dirs", {})
+        built: dict[str, str] = {}
+        incomplete = False
+        for key in sorted(groups):
+            items = sorted(set(groups[key]))
+            signature = hashlib.sha256("\n".join(f"{name} {sha}" for name, sha in items).encode("utf-8")).hexdigest()
+            cached = dirs.get(key)
+            if isinstance(cached, dict) and cached.get("sig") == signature and isinstance(cached.get("tree"), str):
+                built[key] = cached["tree"]
+                continue
+            chunks = max(1, (len(items) + _TREE_CHUNK - 1) // _TREE_CHUNK)
+            if writes + chunks > self.write_budget:
+                incomplete = True
+                break
+            entries = [
+                {"path": name, "mode": "100644", "type": "blob", "sha": sha}
+                for name, sha in items
+            ]
+            tree_sha = self._post_tree_chunks(entries, None)
+            built[key] = tree_sha
+            dirs[key] = {"sig": signature, "tree": tree_sha}
+            save(progress)
+            writes += chunks
+        if incomplete or len(built) != len(groups):
+            return core_sha, False
+        tree_sha = self._assemble(loose, built)
+        final = self._finish_commit(LIVE_BRANCH, COMMIT_MESSAGE, tree_sha, [core_sha], True)
+        return final, True
+
+    def _assemble(self, loose: dict[str, str], built: dict[str, str]) -> str:
+        nodes: dict = {}
+
+        def place(path: str, value: tuple[str, str]) -> None:
+            node = nodes
+            parts = path.split("/")
+            for part in parts[:-1]:
+                child = node.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    node[part] = child
+                node = child
+            node[parts[-1]] = value
+
+        for path, sha in loose.items():
+            place(path, ("blob", sha))
+        for path, sha in built.items():
+            place(path, ("tree", sha))
+
+        def build(node: dict) -> str:
+            entries = []
+            for name in sorted(node):
+                value = node[name]
+                if isinstance(value, dict):
+                    entries.append({"path": name, "mode": "040000", "type": "tree", "sha": build(value)})
+                elif value[0] == "tree":
+                    entries.append({"path": name, "mode": "040000", "type": "tree", "sha": value[1]})
+                else:
+                    entries.append({"path": name, "mode": "100644", "type": "blob", "sha": value[1]})
+            return self._post_tree_chunks(entries, None)
+
+        return build(nodes)
+
+    def commit_files(self, branch: str, files: dict[str, bytes], message: str, progress: dict | None = None, save=None) -> tuple[str, bool]:
         if _wide_coin_dirs(files):
-            return self._commit_wide(branch, message, files)
-        return self._commit_tree(branch, message, files, catch_up=True)
+            self.commit_cores(files)
+            cached = progress if progress is not None else {"v": 1, "dirs": {}, "blobs": {}}
+            return self.backfill_coins(files, cached, save or (lambda _progress: None))
+        return self._commit_tree(branch, message, files, catch_up=True), True
+
+    def _linked_tree(self, commit_sha: str, path: str) -> str | None:
+        """Sha of a tree entry at `path`, including a single entry whose name contains slashes."""
+        commit = self.request("GET", f"/repos/{self.repo}/git/commits/{commit_sha}").json()
+        node = commit["tree"]["sha"]
+        direct = self.request("GET", f"/repos/{self.repo}/git/trees/{node}").json()
+        for item in direct.get("tree") or []:
+            if item.get("path") == path and item.get("type") == "tree":
+                return str(item.get("sha") or "")
+        for part in path.split("/"):
+            tree = self.request("GET", f"/repos/{self.repo}/git/trees/{node}").json()
+            match = next((item for item in tree.get("tree") or [] if item.get("path") == part), None)
+            if not match or match.get("type") != "tree" or not match.get("sha"):
+                return None
+            node = str(match["sha"])
+        return node
 
     def _live_sha_entries(self, files: dict[str, bytes]) -> list[dict]:
         """Current ciphertext blob ids under web/live. These replace any copy on main."""
@@ -662,6 +895,8 @@ class GitHub:
             if not live_tip:
                 raise PublishError("live branch was not found")
             live_tree = self.request("GET", f"/repos/{self.repo}/git/commits/{live_tip}").json()["tree"]["sha"]
+            if pages_tip and not rebuild_from_main and self._linked_tree(pages_tip, "web/live") == live_tree:
+                return pages_tip
             if rebuild_from_main or not pages_tip:
                 if not main_tip:
                     raise PublishError("main branch was not found")
@@ -739,8 +974,27 @@ def _publish(root: Path, github: GitHub) -> str:
     marker = dispatch_marker(root)
     if not changed and not main_moved and not marker.is_file():
         return "unchanged"
-    if changed:
-        live_sha = github.commit_files(LIVE_BRANCH, files, COMMIT_MESSAGE)
+    if changed and _wide_coin_dirs(files):
+        progress = load_progress(root)
+        github.commit_cores(files)
+        live_tip = github.branch_tip(LIVE_BRANCH)
+        if not live_tip:
+            raise PublishError("live branch was not found")
+        github.commit_site(files, live_tip, main_tip, main_moved)
+        store_main_tip(root, main_tip)
+        try:
+            live_sha, settled = github.backfill_coins(
+                files,
+                progress,
+                lambda current: store_progress(root, current),
+            )
+        except RateLimitError:
+            raise
+        if not settled:
+            marker.unlink(missing_ok=True)
+            return "partial"
+    elif changed:
+        live_sha = github.commit_files(LIVE_BRANCH, files, COMMIT_MESSAGE)[0]
     else:
         live_sha = github.branch_tip(LIVE_BRANCH)
         if not live_sha:
