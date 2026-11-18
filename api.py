@@ -248,7 +248,282 @@ def build_state(db, settings) -> dict:
             for row in db.coins()
         ],
         "positions": [_position(row) for row in positions],
+        "book": build_book(db, settings, now, beats, scans),
         "settings": _settings_snapshot(settings),
+    }
+
+
+_SOLD_CAP = 50
+_PIPELINE_CAP = 12
+_EXIT_WORDS = {
+    "stop": "Stop loss",
+    "trail": "Take profit",
+    "timeout": "Time exit",
+    "pulled": "Liquidity pulled",
+}
+
+
+def exit_words(reason: str | None) -> str | None:
+    if not reason:
+        return None
+    return _EXIT_WORDS.get(str(reason), str(reason).replace("_", " ").capitalize())
+
+
+def _num(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _money(value):
+    number = _num(value)
+    if number is None:
+        return None
+    return round(number, 2)
+
+
+def _minutes_between(start: str | None, end: str | None):
+    if not start or not end:
+        return None
+    try:
+        return int((parse_iso(end) - parse_iso(start)).total_seconds() // 60)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coin_label(db, mint: str, fallback: str | None):
+    coin = db.coin(mint) if mint else None
+    name = (coin["name"] if coin and coin["name"] else None) or fallback or None
+    symbol = coin["symbol"] if coin and coin["symbol"] else None
+    return name, symbol
+
+
+def _tokens(spent, entry):
+    cost = _num(spent)
+    price = _num(entry)
+    if cost is None or price is None or price <= 0:
+        return None
+    return cost / price
+
+
+def _take_profit(entry, trail_start_pct):
+    price = _num(entry)
+    start = _num(trail_start_pct)
+    if price is None or start is None:
+        return None
+    return price * (1 + start / 100.0)
+
+
+def _trail_line(peak, trail_pct, active) -> float | None:
+    if not active:
+        return None
+    top = _num(peak)
+    give = _num(trail_pct)
+    if top is None or give is None:
+        return None
+    return top * (1 - give / 100.0)
+
+
+def _holding(db, row, now) -> dict:
+    name, symbol = _coin_label(db, row["mint"], row["name"])
+    entry = _num(row["entry_price"])
+    spent = _num(row["size_usd"])
+    last = db.latest_price(row["mint"])
+    price = _num(last["price"]) if last else None
+    value = None
+    pnl = None
+    pnl_pct = None
+    if price is not None and entry is not None and entry > 0 and spent is not None:
+        value = spent * (price / entry)
+        pnl = value - spent
+        pnl_pct = (price / entry - 1) * 100.0
+    return {
+        "mint": row["mint"],
+        "name": name,
+        "symbol": symbol,
+        "boughtAt": row["opened_at"],
+        "entry": entry,
+        "spent": _money(spent),
+        "tokens": _tokens(spent, entry),
+        "price": price,
+        "value": _money(value),
+        "pnlUsd": _money(pnl),
+        "pnlPct": None if pnl_pct is None else round(pnl_pct, 2),
+        "stop": _num(row["stop_price"]),
+        "takeProfit": _take_profit(row["entry_price"], row["trail_start_pct"]),
+        "trail": _trail_line(row["peak_price"], row["trail_pct"], row["trail_active"]),
+        "heldMin": _minutes_between(row["opened_at"], iso(now)),
+        "link": coin_url(row["mint"], "solana"),
+    }
+
+
+def _sold_row(db, row) -> dict:
+    name, symbol = _coin_label(db, row["mint"], row["name"])
+    entry = _num(row["entry_price"])
+    exit_price = _num(row["exit_price"])
+    spent = _num(row["size_usd"])
+    pnl = _num(row["pnl_usd"])
+    pnl_pct = None
+    if entry is not None and entry > 0 and exit_price is not None:
+        pnl_pct = (exit_price / entry - 1) * 100.0
+    elif pnl is not None and spent not in (None, 0):
+        pnl_pct = pnl / spent * 100.0
+    return {
+        "mint": row["mint"],
+        "name": name,
+        "symbol": symbol,
+        "boughtAt": row["opened_at"],
+        "soldAt": row["closed_at"],
+        "heldMin": _minutes_between(row["opened_at"], row["closed_at"]),
+        "entry": entry,
+        "exit": exit_price,
+        "reason": row["exit_reason"],
+        "reasonText": exit_words(row["exit_reason"]),
+        "pnlUsd": _money(pnl),
+        "pnlPct": None if pnl_pct is None else round(pnl_pct, 2),
+        "fees": _money(row["fees_usd"]),
+        "link": coin_url(row["mint"], "solana"),
+    }
+
+
+def _pipeline(db, scans, since: str) -> list[dict]:
+    verdicts = {}
+    for row in db.verdicts_since(since):
+        verdicts.setdefault(row["mint"], row)
+    items = []
+    for scan in list(scans)[:_PIPELINE_CAP]:
+        name, symbol = _coin_label(db, scan["mint"], None)
+        layers = db.audits_for(scan["mint"])
+        retrying = any(layer["value_text"] == "retrying" for layer in layers)
+        failed = next(
+            (
+                layer
+                for layer in layers
+                if layer["pass"] == 0 and layer["value_text"] not in ("not checked", "retrying")
+            ),
+            None,
+        )
+        passed = bool(layers) and all(layer["pass"] for layer in layers)
+        if retrying:
+            audit = "retrying"
+        elif failed:
+            audit = "fail"
+        elif passed:
+            audit = "pass"
+        else:
+            audit = None
+        analyst = verdicts.get(scan["mint"])
+        if analyst is None:
+            analyst_state = None
+        elif analyst["pass"]:
+            analyst_state = "pass"
+        else:
+            analyst_state = "reject"
+        items.append(
+            {
+                "mint": scan["mint"],
+                "name": name,
+                "symbol": symbol,
+                "scan": scan["verdict"],
+                "scanReason": scan["reason"],
+                "audit": audit,
+                "failedLayer": None if failed is None else failed["name"],
+                "analyst": analyst_state,
+                "analystReason": None if analyst is None else analyst["reason"],
+            }
+        )
+    return items
+
+
+def _health(agents: dict) -> list[dict]:
+    labels = (
+        ("scanner", "Scanner"),
+        ("auditor", "Auditor"),
+        ("analyst", "Analyst"),
+        ("executor", "Executor"),
+        ("risk", "Risk"),
+    )
+    rows = []
+    for key, label in labels:
+        card = agents.get(key) or {}
+        rows.append({"name": label, "up": bool(card.get("running")) and not card.get("paused")})
+    return rows
+
+
+def build_book(db, settings, now=None, beats=None, scans=None) -> dict:
+    """Read-only holdings, sales, and the night's pipeline. Missing prices stay null."""
+    now = now or utc_now()
+    since = settings.get("desk.night_start") or "1970"
+    start = _num(settings.get("desk.night_start_equity"))
+    if start is None:
+        start = _num(settings.get("desk.paper_start_stack")) or 0.0
+    holdings = [_holding(db, row, now) for row in db.open_positions()]
+    closed = list(db.closed_totals())
+    realized_total = 0.0
+    realized_today = 0.0
+    wins = 0
+    losses = 0
+    for row in closed:
+        pnl = _num(row["pnl_usd"])
+        if pnl is None:
+            continue
+        realized_total += pnl
+        if row["closed_at"] and str(row["closed_at"]) >= since:
+            realized_today += pnl
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+    spent = 0.0
+    spent_known = True
+    priced = True
+    holdings_value = 0.0
+    for row in holdings:
+        cost = _num(row["spent"])
+        if cost is None:
+            spent_known = False
+        else:
+            spent += cost
+        if row["value"] is None:
+            priced = False
+        else:
+            holdings_value += float(row["value"])
+    if not holdings:
+        priced = True
+        holdings_value = 0.0
+    cash = None if not spent_known else start + realized_today - spent
+    equity = None if cash is None or not priced else cash + holdings_value
+    if scans is None:
+        scans = db.scans_since(since)
+    if beats is None:
+        beats = db.latest_heartbeats()
+    positions = db.open_positions()
+    agents = {
+        "scanner": _scanner_card(db, scans, beats, settings),
+        "auditor": _auditor_card(db, since, beats, settings),
+        "analyst": _analyst_card(db, since, beats, settings),
+        "executor": _executor_card(db, since, beats, settings),
+        "risk": _risk_card(db, since, beats, settings, bool(positions)),
+    }
+    return {
+        "summary": {
+            "cash": _money(cash),
+            "holdingsValue": None if not priced else _money(holdings_value),
+            "equity": _money(equity),
+            "realizedToday": _money(realized_today),
+            "realizedTotal": _money(realized_total),
+            "wins": wins,
+            "losses": losses,
+            "openCount": len(holdings),
+            "soldCount": len(closed),
+        },
+        "holdings": holdings,
+        "sold": [_sold_row(db, row) for row in db.closed_positions(_SOLD_CAP)],
+        "pipeline": _pipeline(db, scans, since),
+        "health": _health(agents),
     }
 
 
