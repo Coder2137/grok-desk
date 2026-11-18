@@ -18,6 +18,7 @@
     seen: Number(localStorage.getItem(localStorage.getItem("deskSlot") === "desk2" ? "deskSeen2" : localStorage.getItem("deskSlot") === "desk3" ? "deskSeen3" : "deskSeen") || 0),
     more: { activity: 8, scanner: 4, analyst: 4, coins: 0, search: 8 },
     openGroups: {},
+    look: localStorage.getItem("deskLook") === "b" || localStorage.getItem("deskLook") === "c" ? localStorage.getItem("deskLook") : "a",
   };
 
   const DESK_ORDER = [
@@ -205,8 +206,41 @@
     localStorage.setItem(seenKey(deskSlot()), String(max));
   }
 
+  function deskModel() {
+    const data = state.data || {};
+    const book = data.book || {};
+    const trades = (data.activityMore || data.activity || []).filter((row) => {
+      return row && (row.kind === "bought" || row.kind === "sold" || row.kind === "stopped");
+    });
+    return {
+      example: false,
+      name: data.deskName || deskLabel(),
+      paper: !!data.paper,
+      updatedAt: data.ts,
+      summary: book.summary || {},
+      holdings: book.holdings || [],
+      sold: book.sold || [],
+      pipeline: book.pipeline || [],
+      health: book.health || [],
+      activity: trades,
+    };
+  }
+
+  function looksHtml() {
+    const choices = [
+      ["a", "A · Terminal"],
+      ["b", "B · Cards"],
+      ["c", "C · Board"],
+    ];
+    return `<div class="looks" role="tablist" aria-label="Page look">${choices.map((item) => `
+      <button type="button" data-look="${item[0]}" class="${state.look === item[0] ? "on" : ""}" aria-selected="${state.look === item[0]}">${item[1]}</button>`).join("")}</div>`;
+  }
+
   function home() {
     if (!state.data) return loading();
+    if (window.DeskView) {
+      return `${desksHtml()}${looksHtml()}${window.DeskView.renderDesk(deskModel(), state.look)}`;
+    }
     const data = state.data;
     const change = Number(data.dayChangePct || 0);
     const hits = filteredCoins().slice(0, state.more.search);
@@ -473,6 +507,14 @@
         }
       });
     }
+    document.querySelectorAll("[data-look]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const chosen = button.dataset.look;
+        state.look = chosen === "b" || chosen === "c" ? chosen : "a";
+        localStorage.setItem("deskLook", state.look);
+        render();
+      });
+    });
     document.querySelectorAll("[data-desk]").forEach((button) => {
       button.addEventListener("click", () => {
         const chosen = button.dataset.desk;

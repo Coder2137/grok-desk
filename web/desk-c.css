@@ -1,0 +1,47 @@
+/* C · one-screen board. Tight tiles, short lists. Delete this file if another look is chosen. */
+.desk.look-c {
+  background: #10141c;
+  color: #e7edf5;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  padding: 10px 10px 16px;
+}
+.desk.look-c h1 { margin: 0; font-size: 18px; }
+.desk.look-c h2 { margin: 10px 0 4px; font-size: 12px; color: #93a0b5; font-weight: 600; }
+.desk.look-c .desk-title { display: flex; align-items: center; gap: 6px; }
+.desk.look-c .desk-badge, .desk.look-c .desk-example {
+  background: #243044;
+  color: #9ad0ff;
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 10px;
+}
+.desk.look-c .desk-example { color: #ffd27a; }
+.desk.look-c .desk-age { margin: 2px 0 6px; color: #93a0b5; }
+.desk.look-c .desk-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.desk.look-c .desk-stats div { background: #1a2130; border-radius: 10px; padding: 8px; }
+.desk.look-c .desk-stats span { display: block; color: #93a0b5; font-size: 10px; }
+.desk.look-c .up { color: #5ee0a0; }
+.desk.look-c .down { color: #ff8d86; }
+.desk.look-c .muted { color: #93a0b5; }
+.desk.look-c .desk-line, .desk.look-c .desk-feed li, .desk.look-c .desk-pipe li, .desk.look-c .desk-card {
+  margin: 0 0 4px;
+  padding: 6px 8px;
+  background: #1a2130;
+  border-radius: 8px;
+}
+.desk.look-c .desk-card header { display: flex; justify-content: space-between; }
+.desk.look-c .desk-empty { color: #93a0b5; margin: 0; }
+.desk.look-c .desk-feed, .desk.look-c .desk-pipe { list-style: none; margin: 0; padding: 0; }
+.desk.look-c .desk-pipe li span { display: inline; }
+.desk.look-c .desk-pipe li span:before { content: " · "; }
+.desk.look-c .desk-health { display: flex; gap: 6px; flex-wrap: wrap; margin: 0; }
+.desk.look-c .desk-health span { background: #1a2130; border-radius: 8px; padding: 4px 6px; font-size: 11px; }
+.desk.look-c .desk-link { color: #9ad0ff; }
+.desk.look-c .chart-wrap { height: 72px; }
+.desk.look-c .desk-feed li:nth-child(n + 5),
+.desk.look-c .desk-pipe li:nth-child(n + 4) { display: none; }

@@ -1,0 +1,58 @@
+/* A · dark trading terminal. Dense tables. Delete this file if another look is chosen. */
+.desk.look-a {
+  background: #07080a;
+  color: #d7e0d2;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 8px 8px 24px;
+}
+.desk.look-a h1 { margin: 0; font-size: 16px; letter-spacing: 0.04em; }
+.desk.look-a h2 {
+  margin: 16px 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #8ea58a;
+}
+.desk.look-a .desk-title { display: flex; align-items: center; gap: 8px; }
+.desk.look-a .desk-badge, .desk.look-a .desk-example {
+  border: 1px solid #c6a15a;
+  color: #c6a15a;
+  padding: 1px 6px;
+  font-size: 10px;
+}
+.desk.look-a .desk-example { border-color: #d7e0d2; color: #d7e0d2; }
+.desk.look-a .desk-age { margin: 4px 0 8px; color: #8ea58a; }
+.desk.look-a .desk-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px 8px;
+  border-top: 1px solid #243024;
+  border-bottom: 1px solid #243024;
+  padding: 6px 0;
+}
+.desk.look-a .desk-stats span { display: block; color: #8ea58a; font-size: 10px; }
+.desk.look-a .desk-stats b { font-weight: 600; }
+.desk.look-a .up { color: #7dffb3; }
+.desk.look-a .down { color: #ff7a72; }
+.desk.look-a .muted { color: #8ea58a; }
+.desk.look-a .desk-table-wrap { overflow-x: auto; }
+.desk.look-a .desk-table { width: 100%; border-collapse: collapse; }
+.desk.look-a .desk-table th, .desk.look-a .desk-table td {
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid #243024;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.desk.look-a .desk-table th { color: #8ea58a; font-weight: 500; }
+.desk.look-a .desk-empty { color: #8ea58a; margin: 0; }
+.desk.look-a .desk-feed, .desk.look-a .desk-pipe { list-style: none; margin: 0; padding: 0; }
+.desk.look-a .desk-feed li, .desk.look-a .desk-pipe li {
+  padding: 4px 0;
+  border-bottom: 1px solid #243024;
+}
+.desk.look-a .desk-pipe li span { display: block; color: #8ea58a; }
+.desk.look-a .desk-health { display: flex; flex-wrap: wrap; gap: 8px; }
+.desk.look-a .desk-link { color: #c6a15a; margin-left: 6px; }
+.desk.look-a .chart-wrap { height: 120px; }

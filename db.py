@@ -450,6 +450,26 @@ class Database:
             (ts, ts),
         ).fetchall()
 
+    def closed_positions(self, limit: int = 50):
+        return self.conn.execute(
+            """
+            SELECT * FROM positions
+            WHERE status = 'closed'
+            ORDER BY COALESCE(closed_at, opened_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (max(0, int(limit)),),
+        ).fetchall()
+
+    def closed_totals(self):
+        return self.conn.execute(
+            """
+            SELECT pnl_usd, fees_usd, closed_at
+            FROM positions
+            WHERE status = 'closed'
+            """
+        ).fetchall()
+
     def add_activity(self, kind, mint, agent, title, subtitle, value, ts: str | None = None) -> None:
         self.conn.execute(
             """

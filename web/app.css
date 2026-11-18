@@ -123,6 +123,20 @@ a { color: var(--cyan); text-decoration: none; }
   border: 0;
   outline: none;
 }
+.looks {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+.looks button {
+  flex: 1;
+  border-radius: 999px;
+  padding: 6px 8px;
+  background: var(--card);
+  color: var(--muted);
+  font-size: 12px;
+}
+.looks button.on { color: var(--text); background: #2c2c2e; }
 .paper {
   margin: 0 16px 8px;
   color: var(--green);

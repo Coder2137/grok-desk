@@ -1,4 +1,4 @@
-const SHELL = ["./index.html", "./app.css", "./app.js", "./live.js", "./chart.js", "./manifest.json", "./icons/icon-192.png", "./icons/apple-touch-icon.png"];
+const SHELL = ["./index.html", "./app.css", "./app.js", "./desk.js", "./desk-a.css", "./desk-b.css", "./desk-c.css", "./live.js", "./chart.js", "./manifest.json", "./icons/icon-192.png", "./icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open("desk-shell").then((cache) => cache.addAll(SHELL)));
