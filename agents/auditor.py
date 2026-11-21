@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -28,6 +29,12 @@ from sources import TOKEN_2022, TOKEN_PROGRAM, RpcRefused, dexscreener_pair, rpc
 
 LOG = file_logger("auditor", "auditor.log")
 HEARTBEAT_S = 30
+# One coin must not hold the auditor. A hung lookup is fail-closed, and the
+# heartbeat keeps running on its own timer while that lookup is in flight.
+AUDIT_LIMIT_S = 90
+_SCAN_LIMIT_S = 45
+_MAX_SIGNATURE_PAGES = 40
+_MAX_BACKOFF_S = 20
 # Three readings. A transient miss waits 2 minutes, then 5. The next try is
 # dropped when it would land after the scanner's pool-age window.
 MAX_AUDIT_TRIES = 3
@@ -208,6 +215,12 @@ def audit_from_facts(facts: dict) -> dict:
             "holders": holders,
             "reason": reason,
         }
+
+    if facts.get("timed_out"):
+        value = "no data: timeout"
+        layers.append(_layer(1, False, value, "rpc"))
+        _rest(2, layers)
+        return finish(False, value, 1)
 
     # 1 mint authority
     mint_auth = facts.get("mint_authority", MISSING)
@@ -441,21 +454,47 @@ class Auditor:
             self._rpc_lock = asyncio.Lock()
         return self._rpc_lock
 
-    async def run(self) -> None:
+    async def _heartbeat_loop(self) -> None:
+        """Beat even while a lookup is still running. The audit task does not own this."""
         while True:
-            self._load_pending()
-            self._release_due()
+            await asyncio.sleep(HEARTBEAT_S)
             try:
-                message = await asyncio.wait_for(self.bus.auditor.get(), timeout=self._next_timeout())
-            except asyncio.TimeoutError:
                 self.db.heartbeat("auditor")
-                continue
-            try:
-                if self.settings.get("auditor.enabled") and not self.settings.get("agent.auditor.paused"):
-                    await self.handle(message)
             except Exception as exc:
-                log(LOG, f"auditor error {exc.__class__.__name__}")
-            self.db.heartbeat("auditor")
+                log(LOG, f"heartbeat {exc.__class__.__name__}")
+
+    async def run(self) -> None:
+        beater = asyncio.create_task(self._heartbeat_loop())
+        try:
+            while True:
+                self._load_pending()
+                self._release_due()
+                try:
+                    message = await asyncio.wait_for(self.bus.auditor.get(), timeout=self._next_timeout())
+                except asyncio.TimeoutError:
+                    self.db.heartbeat("auditor")
+                    continue
+                try:
+                    await asyncio.wait_for(self._audit_message(message), AUDIT_LIMIT_S)
+                except asyncio.TimeoutError:
+                    log(LOG, "audit timed out")
+                    try:
+                        await self._record_timeout(message)
+                    except Exception as exc:
+                        log(LOG, f"auditor error {exc.__class__.__name__}")
+                except Exception as exc:
+                    log(LOG, f"auditor error {exc.__class__.__name__}")
+                self.db.heartbeat("auditor")
+        finally:
+            beater.cancel()
+            try:
+                await beater
+            except asyncio.CancelledError:
+                pass
+
+    async def _audit_message(self, message: dict) -> None:
+        if self.settings.get("auditor.enabled") and not self.settings.get("agent.auditor.paused"):
+            await self.handle(message)
 
     def _next_timeout(self) -> float:
         wait = float(HEARTBEAT_S)
@@ -569,12 +608,26 @@ class Auditor:
                 layer["source"],
             )
 
+    async def _record_timeout(self, message: dict) -> dict:
+        """A lookup that did not finish is not a pass."""
+        facts = {
+            "mint": message.get("mint"),
+            "ts": iso(utc_now()),
+            "settings": self.settings.all(),
+            "timed_out": True,
+        }
+        return await self._apply(message, facts, True)
+
     async def handle(self, message: dict, enqueue: bool = True) -> dict:
         mint = message["mint"]
         since = self.settings.get("desk.night_start") or "1970"
         if self.db.rejected_tonight(mint, since):
             return {"passed": False, "reason": "already rejected", "layers": []}
         facts = await self.gather(message)
+        return await self._apply(message, facts, enqueue)
+
+    async def _apply(self, message: dict, facts: dict, enqueue: bool = True) -> dict:
+        mint = message["mint"]
         result = audit_from_facts(facts)
         retrying = not result["passed"] and is_transient_reason(result.get("reason")) and self._defer(message, result)
         if result["passed"] or not retrying:
@@ -951,7 +1004,7 @@ class Auditor:
         header = response.headers.get("Retry-After") if response.headers else None
         if header:
             try:
-                retry_after = max(1, int(float(header)))
+                retry_after = min(_MAX_BACKOFF_S, max(1, int(float(header))))
             except (TypeError, ValueError):
                 retry_after = None
         if response.status_code == 429:
@@ -999,7 +1052,7 @@ class Auditor:
                 if round_index + 1 >= rounds:
                     break
                 delay = wait if wait is not None else min(8, 2 ** round_index)
-                await self._sleep(max(1, delay))
+                await self._sleep(min(_MAX_BACKOFF_S, max(1, delay)))
             return None, last
 
     def _remember_pages(self, address: str, collected: list, before: str | None, done: bool) -> None:
@@ -1019,7 +1072,13 @@ class Auditor:
             before = saved.get("before") if isinstance(saved.get("before"), str) else None
             if before:
                 seen.add(before)
+        started = time.monotonic()
+        pages = 0
         while True:
+            pages += 1
+            if pages > _MAX_SIGNATURE_PAGES or time.monotonic() - started > _SCAN_LIMIT_S:
+                self._remember_pages(address, collected, before, False)
+                return None, "timeout", True
             options = {"limit": 1000}
             if before:
                 options["before"] = before
